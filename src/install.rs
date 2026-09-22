@@ -154,9 +154,8 @@ fn utf16_bom(text: &str) -> Vec<u8> {
 #[cfg(windows)]
 fn run_schtasks(args: &[&str]) -> Result<()> {
     use std::io::ErrorKind;
-    use std::process::Command;
 
-    let output = Command::new("schtasks")
+    let output = crate::command::new("schtasks")
         .args(args)
         .output()
         .map_err(|error| {
@@ -267,15 +266,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn schtasks_registers_the_logon_task() {
-        use std::process::Command;
-
         let name = "agent-transcript watch test";
         let _guard = TaskGuard(name);
         let exe = current_executable().expect("current exe");
         let user = windows_user().expect("user");
         register(name, &exe, &user).expect("register");
 
-        let output = Command::new("schtasks")
+        let output = crate::command::new("schtasks")
             .args(["/Query", "/TN", name, "/XML"])
             .output()
             .expect("query");
@@ -327,9 +324,7 @@ mod tests {
     #[cfg(windows)]
     impl Drop for TaskGuard {
         fn drop(&mut self) {
-            use std::process::Command;
-
-            let _ = Command::new("schtasks")
+            let _ = crate::command::new("schtasks")
                 .args(["/Delete", "/TN", self.0, "/F"])
                 .output();
         }

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use url::Url;
 
@@ -93,7 +92,7 @@ impl std::fmt::Display for OriginError {
 }
 
 pub fn origin_of(dir: &Path) -> std::result::Result<String, OriginError> {
-    let output = Command::new("git")
+    let output = crate::command::new("git")
         .arg("-C")
         .arg(dir)
         .args(["remote", "get-url", "origin"])

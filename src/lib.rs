@@ -1,4 +1,5 @@
 pub mod catalog;
+pub(crate) mod command;
 pub mod config;
 pub mod crypto;
 pub mod document;
