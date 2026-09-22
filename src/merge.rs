@@ -42,6 +42,9 @@ pub struct RemoteView {
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub model: Option<String>,
+    /// Catalog revisions at the current rank disagree. A strictly newer local
+    /// snapshot still wins; otherwise the session has no single body.
+    pub ambiguous: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,35 +69,84 @@ pub struct MergedView {
     pub content_hash: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Current {
+    Index(usize),
+    Ambiguous { display: usize },
+}
+
+/// The current snapshot among a session's revisions.
+///
+/// Order is `updated_at`, then the last message time, then message count.
+/// Equal rank and equal content hash are the same body. Equal rank and
+/// different hashes have no current body.
+pub fn choose_current(items: &[Freshness]) -> Result<Current> {
+    let mut indexes = items.iter().enumerate();
+    let Some((mut best, _)) = indexes.next() else {
+        return Err(Error::msg("session has no revisions"));
+    };
+    let mut tied = false;
+    for (index, freshness) in indexes {
+        match rank(&items[best], freshness) {
+            Rank::Left => {}
+            Rank::Right => {
+                best = index;
+                tied = false;
+            }
+            Rank::Same => {}
+            Rank::Ambiguous => tied = true,
+        }
+    }
+    Ok(if tied {
+        Current::Ambiguous { display: best }
+    } else {
+        Current::Index(best)
+    })
+}
+
 pub fn prefer(left: &Freshness, right: &Freshness) -> Result<Side> {
+    match rank(left, right) {
+        Rank::Left | Rank::Same => Ok(Side::Local),
+        Rank::Right => Ok(Side::Remote),
+        Rank::Ambiguous => Err(Error::Ambiguous {
+            harness: String::new(),
+            session_id: String::new(),
+        }),
+    }
+}
+
+enum Rank {
+    Left,
+    Right,
+    Same,
+    Ambiguous,
+}
+
+fn rank(left: &Freshness, right: &Freshness) -> Rank {
     let left_time = left.updated_at.or(left.last_message_at);
     let right_time = right.updated_at.or(right.last_message_at);
     match (left_time, right_time) {
         (Some(left_time), Some(right_time)) if left_time != right_time => {
-            return Ok(if left_time > right_time {
-                Side::Local
+            return if left_time > right_time {
+                Rank::Left
             } else {
-                Side::Remote
-            });
+                Rank::Right
+            };
         }
-        (Some(_), None) => return Ok(Side::Local),
-        (None, Some(_)) => return Ok(Side::Remote),
+        (Some(_), None) => return Rank::Left,
+        (None, Some(_)) => return Rank::Right,
         _ => {}
     }
-    if left.message_count != right.message_count {
-        return Ok(if left.message_count > right.message_count {
-            Side::Local
-        } else {
-            Side::Remote
-        });
+    match left.message_count.cmp(&right.message_count) {
+        std::cmp::Ordering::Greater => return Rank::Left,
+        std::cmp::Ordering::Less => return Rank::Right,
+        std::cmp::Ordering::Equal => {}
     }
     if left.content_hash == right.content_hash {
-        return Ok(Side::Local);
+        Rank::Same
+    } else {
+        Rank::Ambiguous
     }
-    Err(Error::Ambiguous {
-        harness: String::new(),
-        session_id: String::new(),
-    })
 }
 
 pub fn select(
@@ -149,22 +201,29 @@ fn matches_scope(
 }
 
 fn merge_pair(local: &LocalView, remote: &RemoteView) -> Result<MergedView> {
+    if remote.ambiguous && !matches!(rank(&local.freshness, &remote.freshness), Rank::Left) {
+        return Ok(ambiguous_local(local));
+    }
     match prefer(&local.freshness, &remote.freshness) {
         Ok(Side::Local) => Ok(from_local(local)),
         Ok(Side::Remote) => Ok(from_remote(remote)),
-        Err(_) => Ok(MergedView {
-            harness: local.harness,
-            session_id: local.session_id.clone(),
-            pick: Pick::Ambiguous,
-            started_at: local.started_at,
-            title: local.title.clone(),
-            cwd: local.cwd.clone(),
-            git_branch: local.git_branch.clone(),
-            model: local.model.clone(),
-            sort_at: sort_time(&local.freshness, local.started_at),
-            object_key: Some(remote.object_key.clone()),
-            content_hash: String::new(),
-        }),
+        Err(_) => Ok(ambiguous_local(local)),
+    }
+}
+
+fn ambiguous_local(local: &LocalView) -> MergedView {
+    MergedView {
+        harness: local.harness,
+        session_id: local.session_id.clone(),
+        pick: Pick::Ambiguous,
+        started_at: local.started_at,
+        title: local.title.clone(),
+        cwd: local.cwd.clone(),
+        git_branch: local.git_branch.clone(),
+        model: local.model.clone(),
+        sort_at: sort_time(&local.freshness, local.started_at),
+        object_key: None,
+        content_hash: String::new(),
     }
 }
 
@@ -188,15 +247,27 @@ fn from_remote(remote: &RemoteView) -> MergedView {
     MergedView {
         harness: remote.harness,
         session_id: remote.session_id.clone(),
-        pick: Pick::Remote,
+        pick: if remote.ambiguous {
+            Pick::Ambiguous
+        } else {
+            Pick::Remote
+        },
         started_at: remote.started_at,
         title: remote.title.clone(),
         cwd: remote.cwd.clone(),
         git_branch: remote.git_branch.clone(),
         model: remote.model.clone(),
         sort_at: sort_time(&remote.freshness, remote.started_at),
-        object_key: Some(remote.object_key.clone()),
-        content_hash: remote.freshness.content_hash.clone(),
+        object_key: if remote.ambiguous {
+            None
+        } else {
+            Some(remote.object_key.clone())
+        },
+        content_hash: if remote.ambiguous {
+            String::new()
+        } else {
+            remote.freshness.content_hash.clone()
+        },
     }
 }
 
@@ -250,6 +321,7 @@ mod tests {
             cwd: Some("/home/other/repo".into()),
             git_branch: None,
             model: None,
+            ambiguous: false,
         }
     }
 
@@ -324,5 +396,59 @@ mod tests {
         assert!(merged
             .iter()
             .all(|session| session.session_id != "same-path-different-repo"));
+    }
+
+    #[test]
+    fn newer_shorter_revision_is_current() {
+        let items = vec![
+            fresh(Some(1), None, 10, "long-old"),
+            fresh(Some(9), None, 3, "short-new"),
+        ];
+        assert_eq!(choose_current(&items).unwrap(), Current::Index(1));
+    }
+
+    #[test]
+    fn equal_time_and_count_with_different_hashes_have_no_current_revision() {
+        let items = vec![
+            fresh(Some(3), Some(3), 4, "left"),
+            fresh(Some(3), Some(3), 4, "right"),
+        ];
+        assert_eq!(
+            choose_current(&items).unwrap(),
+            Current::Ambiguous { display: 0 }
+        );
+    }
+
+    #[test]
+    fn equal_revision_hashes_are_one_body() {
+        let items = vec![
+            fresh(Some(3), None, 4, "same"),
+            fresh(Some(3), None, 4, "same"),
+        ];
+        assert_eq!(choose_current(&items).unwrap(), Current::Index(0));
+    }
+
+    #[test]
+    fn remote_only_ambiguous_session_has_no_body() {
+        let mut remote = remote(
+            "https://github.com/Org/Repo",
+            "split",
+            fresh(Some(3), None, 4, "a"),
+        );
+        remote.ambiguous = true;
+        let merged = select("https://github.com/Org/Repo", None, &[], &[remote]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].pick, Pick::Ambiguous);
+        assert!(merged[0].content_hash.is_empty());
+    }
+
+    #[test]
+    fn newer_local_wins_over_an_ambiguous_archive() {
+        let repo = "https://github.com/Org/Repo";
+        let local = local(Some(repo), "split", fresh(Some(10), None, 1, "local"));
+        let mut remote = remote(repo, "split", fresh(Some(3), None, 4, "a"));
+        remote.ambiguous = true;
+        let merged = select(repo, None, &[local], &[remote]).unwrap();
+        assert_eq!(merged[0].pick, Pick::Local);
     }
 }

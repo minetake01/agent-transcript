@@ -50,25 +50,6 @@ impl Catalog {
     }
 }
 
-impl SessionRecord {
-    pub fn head(&self) -> Result<&Revision> {
-        self.revisions
-            .iter()
-            .max_by(|left, right| {
-                left.message_count
-                    .cmp(&right.message_count)
-                    .then(left.updated_at.cmp(&right.updated_at))
-                    .then(left.content_hash.cmp(&right.content_hash))
-            })
-            .ok_or_else(|| {
-                Error::msg(format!(
-                    "session {} {} has no revisions",
-                    self.harness, self.session_id
-                ))
-            })
-    }
-}
-
 pub fn merge_catalogs(base: &Catalog, incoming: &Catalog) -> Result<Catalog> {
     if base.schema != SCHEMA {
         return Err(Error::Schema {
@@ -118,7 +99,12 @@ pub fn merge_catalogs(base: &Catalog, incoming: &Catalog) -> Result<Catalog> {
         session
             .revisions
             .sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
-        session.head()?;
+        if session.revisions.is_empty() {
+            return Err(Error::msg(format!(
+                "session {} {} has no revisions",
+                session.harness, session.session_id
+            )));
+        }
     }
     Ok(Catalog {
         schema: SCHEMA,
@@ -198,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_keeps_both_revisions_and_picks_the_longer_head() {
+    fn conflict_keeps_both_revisions() {
         let base = Catalog {
             schema: SCHEMA,
             sessions: vec![session("s1", vec![revision("aa11", 10, Some(1))])],
@@ -210,16 +196,21 @@ mod tests {
         let merged = merge_catalogs(&base, &incoming).unwrap();
         let record = &merged.sessions[0];
         assert_eq!(record.revisions.len(), 2);
-        assert_eq!(record.head().unwrap().content_hash, "aa11");
-    }
-
-    #[test]
-    fn equal_length_head_is_the_newer_update() {
-        let record = session(
-            "s1",
-            vec![revision("aa11", 4, Some(1)), revision("bb22", 4, Some(8))],
+        let freshness = record
+            .revisions
+            .iter()
+            .map(|revision| crate::merge::Freshness {
+                updated_at: revision.updated_at,
+                last_message_at: revision.last_message_at,
+                message_count: revision.message_count,
+                content_hash: revision.content_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crate::merge::choose_current(&freshness).unwrap(),
+            crate::merge::Current::Index(1)
         );
-        assert_eq!(record.head().unwrap().content_hash, "bb22");
+        assert_eq!(record.revisions[1].content_hash, "bb22");
     }
 
     #[test]

@@ -8,9 +8,11 @@ use crate::catalog::Catalog;
 use crate::crypto::Key;
 use crate::document::ArchiveDocument;
 use crate::error::{Error, Result};
-use crate::merge::{select, Freshness, LocalView, MergedView, Pick, RemoteView};
+use crate::merge::{
+    choose_current, select, Current, Freshness, LocalView, MergedView, Pick, RemoteView,
+};
 use crate::remote::{document_from_plaintext, load_plaintext};
-use crate::repo_id::{scope_directory, session_repo, SessionRepo};
+use crate::repo_id::{scope_directory, RepoCache, SessionRepo};
 use crate::store::R2;
 
 pub struct Scope {
@@ -132,13 +134,13 @@ struct Held {
 }
 
 fn discover_held() -> Result<Vec<Held>> {
-    let mut cache: HashMap<String, SessionRepo> = HashMap::new();
+    let mut repos = RepoCache::default();
     let mut held = Vec::new();
     for session in local::discover() {
         if matches!(session.harness, HarnessId::ClaudeChat | HarnessId::ChatGpt) {
             continue;
         }
-        let repo = cached_repo(session.meta.cwd.as_deref(), &mut cache)?;
+        let repo = repos.resolve(session.meta.cwd.as_deref())?;
         let repo_key = match repo {
             SessionRepo::Key(key) => Some(key),
             SessionRepo::MissingCwd | SessionRepo::Unresolved(_) => None,
@@ -162,18 +164,6 @@ fn discover_held() -> Result<Vec<Held>> {
         held.push(Held { session, view });
     }
     Ok(held)
-}
-
-fn cached_repo(cwd: Option<&str>, cache: &mut HashMap<String, SessionRepo>) -> Result<SessionRepo> {
-    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
-        return Ok(SessionRepo::MissingCwd);
-    };
-    if let Some(resolved) = cache.get(cwd) {
-        return Ok(resolved.clone());
-    }
-    let resolved = session_repo(Some(cwd))?;
-    cache.insert(cwd.to_string(), resolved.clone());
-    Ok(resolved)
 }
 
 fn dedupe_locals(held: Vec<Held>) -> Result<Vec<Held>> {
@@ -274,23 +264,39 @@ fn fill(
 fn remote_views(catalog: &Catalog) -> Result<Vec<RemoteView>> {
     let mut views = Vec::new();
     for session in &catalog.sessions {
-        let head = session.head()?;
+        if session.revisions.is_empty() {
+            return Err(Error::msg(format!(
+                "session {} {} has no revisions",
+                session.harness, session.session_id
+            )));
+        }
+        let ranked = session
+            .revisions
+            .iter()
+            .map(|revision| Freshness {
+                updated_at: revision.updated_at,
+                last_message_at: revision.last_message_at,
+                message_count: revision.message_count,
+                content_hash: revision.content_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (index, ambiguous) = match choose_current(&ranked)? {
+            Current::Index(index) => (index, false),
+            Current::Ambiguous { display } => (display, true),
+        };
+        let current = &session.revisions[index];
         views.push(RemoteView {
             harness: session.harness,
             session_id: session.session_id.clone(),
             repo_key: session.repo_key.clone(),
-            freshness: Freshness {
-                updated_at: head.updated_at,
-                last_message_at: head.last_message_at,
-                message_count: head.message_count,
-                content_hash: head.content_hash.clone(),
-            },
-            object_key: head.object_key.clone(),
-            started_at: head.started_at,
-            title: head.title.clone(),
-            cwd: head.cwd.clone(),
-            git_branch: head.git_branch.clone(),
-            model: head.model.clone(),
+            freshness: ranked[index].clone(),
+            object_key: current.object_key.clone(),
+            started_at: current.started_at,
+            title: current.title.clone(),
+            cwd: current.cwd.clone(),
+            git_branch: current.git_branch.clone(),
+            model: current.model.clone(),
+            ambiguous,
         });
     }
     Ok(views)

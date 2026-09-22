@@ -44,8 +44,142 @@ pub fn collect(stored_generations: &BTreeMap<String, String>) -> Result<Collecte
         quiet: Vec::new(),
         generations: BTreeMap::new(),
     };
-    collect_files(&mut collected.candidates);
-    collect_databases(stored_generations, &mut collected)?;
+    if let Some(store) = claude_code::ClaudeStore::default_root() {
+        open_paths(
+            HarnessId::ClaudeCode,
+            tree_generation(&store.root),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = codex::CodexStore::default_root() {
+        open_paths(
+            HarnessId::Codex,
+            tree_generation(&store.sessions_dir),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = pi::PiStore::default_root() {
+        open_paths(
+            HarnessId::Pi,
+            tree_generation(&store.sessions_dir),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = campfire::CampfireStore::default_root() {
+        open_paths(
+            HarnessId::Campfire,
+            tree_generation(&store.sessions_dir),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = cursor::CursorStore::default_root() {
+        open_paths(
+            HarnessId::Cursor,
+            tree_generation(&store.chats_dir),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = amp::AmpStore::default_root() {
+        open_paths(
+            HarnessId::Amp,
+            tree_generation(&store.threads_dir),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = antigravity::AntigravityStore::default_root() {
+        open_paths(
+            HarnessId::Antigravity,
+            tree_generation(&store.root.join("conversations")),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = grok::GrokStore::default_root() {
+        open_paths(
+            HarnessId::Grok,
+            tree_generation(&store.sessions_dir),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = grok_bot::GrokBotStore::default_root() {
+        let generation = format!(
+            "{}\n{}",
+            tree_generation(&store.root),
+            store
+                .agents
+                .as_ref()
+                .map(|path| tree_generation(path))
+                .unwrap_or_else(|| "missing".into())
+        );
+        open_paths(
+            HarnessId::GrokBot,
+            generation,
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = fx::FxStore::default_root() {
+        open_paths(
+            HarnessId::Fx,
+            tree_generation(&store.sessions_dir),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = cowork::CoworkStore::default_root() {
+        open_paths(
+            HarnessId::Cowork,
+            tree_generation(&store.root),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = hermes::HermesStore::default_root() {
+        open_ids(
+            HarnessId::Hermes,
+            db_fingerprint(&store.db_path),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = cursor_desktop::CursorDesktopStore::default_root() {
+        let db = store.user_dir.join("globalStorage").join("state.vscdb");
+        open_ids(
+            HarnessId::CursorDesktop,
+            db_fingerprint(&db),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
+    if let Some(store) = opencode::OpenCodeStore::default_db() {
+        open_ids(
+            HarnessId::OpenCode,
+            db_fingerprint(&store.db_path),
+            store,
+            stored_generations,
+            &mut collected,
+        )?;
+    }
     Ok(collected)
 }
 
@@ -61,228 +195,76 @@ pub fn load(candidate: &Candidate) -> std::result::Result<Loaded, LoadFailure> {
     })
 }
 
-pub fn origin_fingerprint(cwd: &str) -> String {
-    if cwd.is_empty() {
-        return "missing-cwd".into();
-    }
-    let path = Path::new(cwd);
-    if !path.is_dir() {
-        return "missing-cwd".into();
-    }
-    let git = path.join(".git");
-    if git.is_file() {
-        return file_fingerprint(&git);
-    }
-    file_fingerprint(&git.join("config"))
-}
-
-fn collect_files(out: &mut Vec<Candidate>) {
-    if let Some(store) = claude_code::ClaudeStore::default_root() {
-        let mut files = Vec::new();
-        walk_jsonl(&store.root, &["subagents", "tool-results"], &mut files);
-        push_files(HarnessId::ClaudeCode, &files, out);
-    }
-    if let Some(store) = codex::CodexStore::default_root() {
-        let mut files = Vec::new();
-        walk_named(&store.sessions_dir, &mut files, |name, path| {
-            name.starts_with("rollout-") && path.extension().is_some_and(|ext| ext == "jsonl")
-        });
-        push_files(HarnessId::Codex, &files, out);
-    }
-    if let Some(store) = pi::PiStore::default_root() {
-        let mut files = Vec::new();
-        walk_jsonl(&store.sessions_dir, &[], &mut files);
-        push_files(HarnessId::Pi, &files, out);
-    }
-    if let Some(store) = campfire::CampfireStore::default_root() {
-        let mut files = Vec::new();
-        walk_jsonl(&store.sessions_dir, &[], &mut files);
-        push_files(HarnessId::Campfire, &files, out);
-    }
-    if let Some(store) = cursor::CursorStore::default_root() {
-        collect_cursor_stores(&store.chats_dir, out);
-    }
-    if let Some(store) = amp::AmpStore::default_root() {
-        let mut files = Vec::new();
-        if let Ok(entries) = fs::read_dir(&store.threads_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if entry.file_type().is_ok_and(|kind| kind.is_file())
-                    && path.extension().is_some_and(|ext| ext == "json")
-                {
-                    files.push(path);
-                }
-            }
-        }
-        push_files(HarnessId::Amp, &files, out);
-    }
-    if let Some(store) = antigravity::AntigravityStore::default_root() {
-        let mut files = Vec::new();
-        if let Ok(entries) = fs::read_dir(store.root.join("conversations")) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "db") {
-                    files.push(path);
-                }
-            }
-        }
-        push_files(HarnessId::Antigravity, &files, out);
-    }
-}
-
-fn collect_databases(
-    stored_generations: &BTreeMap<String, String>,
-    collected: &mut Collected,
-) -> Result<()> {
-    if let Some(store) = grok::GrokStore::default_root() {
-        gate_paths(
-            HarnessId::Grok,
-            "grok",
-            tree_generation(&store.sessions_dir),
-            Some(store),
-            stored_generations,
-            collected,
-        )?;
-    }
-    if let Some(store) = grok_bot::GrokBotStore::default_root() {
-        let generation = format!(
-            "{}\n{}",
-            tree_generation(&store.root),
-            store
-                .agents
-                .as_ref()
-                .map(|path| tree_generation(path))
-                .unwrap_or_else(|| "missing".into())
-        );
-        gate_paths(
-            HarnessId::GrokBot,
-            "grok_bot",
-            generation,
-            Some(store),
-            stored_generations,
-            collected,
-        )?;
-    }
-    if let Some(store) = fx::FxStore::default_root() {
-        gate_paths(
-            HarnessId::Fx,
-            "fx",
-            tree_generation(&store.sessions_dir),
-            Some(store),
-            stored_generations,
-            collected,
-        )?;
-    }
-    if let Some(store) = cowork::CoworkStore::default_root() {
-        gate_paths(
-            HarnessId::Cowork,
-            "cowork",
-            tree_generation(&store.root),
-            Some(store),
-            stored_generations,
-            collected,
-        )?;
-    }
-    if let Some(store) = hermes::HermesStore::default_root() {
-        gate_ids(
-            HarnessId::Hermes,
-            "hermes",
-            db_fingerprint(&store.db_path),
-            Some(store),
-            stored_generations,
-            collected,
-        )?;
-    }
-    if let Some(store) = cursor_desktop::CursorDesktopStore::default_root() {
-        let db = store.user_dir.join("globalStorage").join("state.vscdb");
-        gate_ids(
-            HarnessId::CursorDesktop,
-            "cursor_desktop",
-            db_fingerprint(&db),
-            Some(store),
-            stored_generations,
-            collected,
-        )?;
-    }
-    if let Some(store) = opencode::OpenCodeStore::default_db() {
-        gate_ids(
-            HarnessId::OpenCode,
-            "opencode",
-            db_fingerprint(&store.db_path),
-            Some(store),
-            stored_generations,
-            collected,
-        )?;
-    }
-    Ok(())
-}
-
-fn gate_paths<S>(
+fn open_paths<S>(
     harness: HarnessId,
-    key: &str,
     generation: String,
-    store: Option<S>,
+    store: S,
     stored_generations: &BTreeMap<String, String>,
     collected: &mut Collected,
 ) -> Result<()>
 where
     S: Store<Ref = PathBuf>,
 {
-    if stored_generations.get(key) == Some(&generation) {
-        collected.quiet.push(harness);
-        return Ok(());
-    }
-    let Some(store) = store else {
-        collected.generations.insert(key.to_string(), generation);
-        return Ok(());
-    };
-    let discovered = store.discover().map_err(tx_error)?;
-    let refs: Vec<PathBuf> = discovered.into_iter().map(|item| item.reference).collect();
-    let fingerprints = store.fingerprints(&refs).unwrap_or_default();
-    for path in refs {
-        let source = path.to_string_lossy().into_owned();
-        let fingerprint = fingerprints
-            .get(&source)
-            .cloned()
-            .filter(|fingerprint| !fingerprint.is_empty())
-            .unwrap_or_else(|| file_fingerprint(&path));
-        collected.candidates.push(Candidate {
-            harness,
-            source,
-            fingerprint,
-        });
-    }
-    collected.generations.insert(key.to_string(), generation);
-    Ok(())
+    open_store(
+        harness,
+        generation,
+        store,
+        stored_generations,
+        collected,
+        |path| path.to_string_lossy().into_owned(),
+    )
 }
 
-fn gate_ids<S>(
+fn open_ids<S>(
     harness: HarnessId,
-    key: &str,
     generation: String,
-    store: Option<S>,
+    store: S,
     stored_generations: &BTreeMap<String, String>,
     collected: &mut Collected,
 ) -> Result<()>
 where
     S: Store<Ref = String>,
 {
+    open_store(
+        harness,
+        generation,
+        store,
+        stored_generations,
+        collected,
+        Clone::clone,
+    )
+}
+
+fn open_store<S, R>(
+    harness: HarnessId,
+    generation: String,
+    store: S,
+    stored_generations: &BTreeMap<String, String>,
+    collected: &mut Collected,
+    source_of: impl Fn(&R) -> String,
+) -> Result<()>
+where
+    S: Store<Ref = R>,
+    R: Clone,
+{
+    let key = harness.as_str();
     if stored_generations.get(key) == Some(&generation) {
         collected.quiet.push(harness);
-        return Ok(());
-    }
-    let Some(store) = store else {
         collected.generations.insert(key.to_string(), generation);
         return Ok(());
-    };
+    }
     let discovered = store.discover().map_err(tx_error)?;
-    let refs: Vec<String> = discovered.into_iter().map(|item| item.reference).collect();
-    let fingerprints = store.fingerprints(&refs).unwrap_or_default();
-    for id in refs {
-        let fingerprint = fingerprints.get(&id).cloned().unwrap_or_default();
+    let refs: Vec<R> = discovered
+        .iter()
+        .map(|item| item.reference.clone())
+        .collect();
+    let fingerprints = store.fingerprints(&refs).map_err(tx_error)?;
+    for item in &discovered {
+        let source = source_of(&item.reference);
+        let fingerprint = fingerprints.get(&source).cloned().unwrap_or_default();
         collected.candidates.push(Candidate {
             harness,
-            source: id,
+            source,
             fingerprint,
         });
     }
@@ -368,78 +350,17 @@ fn tx_error(error: txcript::Error) -> Error {
     Error::msg(error.to_string())
 }
 
-fn push_files(harness: HarnessId, files: &[PathBuf], out: &mut Vec<Candidate>) {
-    for path in files {
-        out.push(Candidate {
-            harness,
-            source: path.to_string_lossy().into_owned(),
-            fingerprint: file_fingerprint(path),
-        });
-    }
+fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified))
 }
 
-fn collect_cursor_stores(chats_dir: &Path, out: &mut Vec<Candidate>) {
-    let Ok(workspaces) = fs::read_dir(chats_dir) else {
-        return;
-    };
-    for workspace in workspaces.flatten() {
-        if !workspace.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let Ok(sessions) = fs::read_dir(workspace.path()) else {
-            continue;
-        };
-        for session in sessions.flatten() {
-            let db = session.path().join("store.db");
-            if db.is_file() {
-                push_files(HarnessId::Cursor, &[db], out);
-            }
-        }
-    }
-}
-
-fn walk_named(dir: &Path, out: &mut Vec<PathBuf>, include: impl Fn(&str, &Path) -> bool + Copy) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            walk_named(&path, out, include);
-            continue;
-        }
-        if include(&name, &path) {
-            out.push(path);
-        }
-    }
-}
-
-fn walk_jsonl(dir: &Path, skip_dirs: &[&str], out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            if !skip_dirs.contains(&name.as_ref()) {
-                walk_jsonl(&path, skip_dirs, out);
-            }
-            continue;
-        }
-        if path.extension().is_some_and(|ext| ext == "jsonl") {
-            out.push(path);
-        }
-    }
+fn db_fingerprint(path: &Path) -> String {
+    [path, &sidecar(path, "-wal"), &sidecar(path, "-shm")]
+        .into_iter()
+        .map(file_fingerprint)
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn file_fingerprint(path: &Path) -> String {
@@ -454,19 +375,6 @@ fn file_fingerprint(path: &Path) -> String {
             format!("{mtime}:{}", meta.len())
         }
     }
-}
-
-fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
-    Some(DateTime::<Utc>::from(modified))
-}
-
-fn db_fingerprint(path: &Path) -> String {
-    [path, &sidecar(path, "-wal"), &sidecar(path, "-shm")]
-        .into_iter()
-        .map(file_fingerprint)
-        .collect::<Vec<_>>()
-        .join("|")
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
