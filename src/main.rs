@@ -29,6 +29,8 @@ enum Command {
     },
     /// Encrypt new and changed local transcripts and store those revisions in R2.
     Ingest,
+    /// Run ingest now, then every five minutes at below-normal priority.
+    Watch,
     /// Serve the read-only MCP tools on stdio.
     Mcp,
     /// Delete archived objects that the catalog no longer references.
@@ -85,6 +87,7 @@ async fn run() -> agent_transcript::Result<()> {
             Ok(())
         }
         Command::Ingest => agent_transcript::ingest::ingest().await,
+        Command::Watch => agent_transcript::ingest::watch().await,
         Command::Mcp => agent_transcript::mcp::serve()
             .await
             .map_err(agent_transcript::Error::msg),

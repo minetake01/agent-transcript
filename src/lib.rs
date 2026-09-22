@@ -11,6 +11,7 @@ pub mod read;
 pub mod remote;
 pub mod repo_id;
 pub mod sessions;
+pub mod sources;
 pub mod store;
 
 pub use error::{Error, Result};

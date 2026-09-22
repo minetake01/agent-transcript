@@ -24,7 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "process", "time"] }
 toml = "0.8"
 txcript = { version = "0.14.4", default-features = false, features = ["search", "opencode", "hermes"] }
 url = "2"
