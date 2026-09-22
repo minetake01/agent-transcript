@@ -27,7 +27,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = CliMode::Readwrite)]
         mode: CliMode,
     },
-    /// Encrypt local transcripts and store new revisions in R2.
+    /// Encrypt new and changed local transcripts and store those revisions in R2.
     Ingest,
     /// Serve the read-only MCP tools on stdio.
     Mcp,
