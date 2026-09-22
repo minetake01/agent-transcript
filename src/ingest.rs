@@ -601,6 +601,15 @@ fn relax_priority() {
         const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
         SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        unsafe extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        }
+        const PRIO_DARWIN_PROCESS: i32 = 4;
+        const PRIO_DARWIN_BG: i32 = 0x1000;
+        setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG);
+    }
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -620,10 +629,24 @@ fn process_alive(pid: u32) -> bool {
             true
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = pid;
-        true
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const EPERM: i32 = 1;
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        unsafe {
+            if kill(pid, 0) == 0 {
+                return true;
+            }
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
     }
 }
 

@@ -29,7 +29,7 @@ enum Command {
     },
     /// Encrypt new and changed local transcripts and store those revisions in R2.
     Ingest,
-    /// Run ingest now, then every five minutes at below-normal priority.
+    /// Run ingest now, then every five minutes at a reduced priority.
     Watch,
     /// Serve the read-only MCP tools on stdio.
     Mcp,
