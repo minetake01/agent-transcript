@@ -30,11 +30,14 @@ agent-transcript init \
 `origin` は認証情報を除き、`git@host:path` や `ssh://` を `https://host/path` にし、ホストだけ小文字にして末尾の `.git` を除いた文字列です。origin を解決できないセッションはアップロードしません。その実行で新たに分かったものは一覧を出して終了コード 1 になり、ファイルも origin も変わっていなければ次の実行は成功します。
 
 ```sh
+agent-transcript install
 agent-transcript ingest
 agent-transcript watch
 agent-transcript gc
 agent-transcript mcp
 ```
+
+`install` は、このコマンドを起動した実行ファイルで `watch` をログオン時に起動するタスク `agent-transcript watch` を、タスク スケジューラへ登録してその場でも起動します。`mode` が `read` のときは登録しません。
 
 `ingest` はハーネスごとにストアの世代を見ます。世代が前回と同じで、記録した内容ハッシュがすべてカタログにあれば、そのストアは開きません。世代が変わったストアだけを discover し、指紋が空か前回と違うソースだけ本文を開きます。指紋が一致してもカタログにその内容ハッシュが無いソースは開き直して送ります。カタログにある内容ハッシュは送りません。
 

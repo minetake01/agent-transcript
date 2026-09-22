@@ -27,6 +27,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = CliMode::Readwrite)]
         mode: CliMode,
     },
+    /// Register the Windows logon task that runs watch.
+    Install,
     /// Encrypt new and changed local transcripts and store those revisions in R2.
     Ingest,
     /// Run ingest now, then every five minutes at a reduced priority.
@@ -84,6 +86,15 @@ async fn run() -> agent_transcript::Result<()> {
                     key_path.display()
                 );
             }
+            Ok(())
+        }
+        Command::Install => {
+            let exe = agent_transcript::install::install()?;
+            println!(
+                "registered logon task `{}` for {}",
+                agent_transcript::install::TASK_NAME,
+                exe.display()
+            );
             Ok(())
         }
         Command::Ingest => agent_transcript::ingest::ingest().await,
