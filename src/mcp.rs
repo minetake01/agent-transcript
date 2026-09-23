@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -5,16 +6,19 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{Implementation, JsonObject, ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
 use rmcp::{
-    tool, tool_handler, tool_router, transport::stdio, ErrorData, ServerHandler, ServiceExt,
+    tool, tool_handler, tool_router, transport::stdio, ErrorData, Peer, RoleServer, ServerHandler,
+    ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use txcript::search::{Case, DocKey, Hit, Index, Origin, Query};
 use txcript::HarnessId;
+use url::Url;
 
 use crate::config;
 use crate::error::Error;
 use crate::fragment::parse_ref;
 use crate::read;
+use crate::repo_id::{self, OriginError};
 use crate::sessions::{self, find_session, Scope};
 use crate::store::R2;
 
@@ -45,7 +49,7 @@ const STANDARD_FORMATS: &[&str] = &[
 struct ListSessionsRequest {
     /// Only include this harness. Omit to include every harness in the repository.
     from: Option<String>,
-    /// Directory whose git origin selects the repository. Omit to use the process working directory.
+    /// Directory whose git origin selects the repository. Omit to use the client workspace, or the process working directory when the client reports no workspace.
     cwd: Option<String>,
     /// Return at most this many sessions. Omit for no cap.
     limit: Option<usize>,
@@ -60,7 +64,7 @@ struct SearchSessionsRequest {
     pattern: String,
     /// Search only this harness. Omit to search every harness in the repository.
     from: Option<String>,
-    /// Directory whose git origin selects the repository. Omit to use the process working directory.
+    /// Directory whose git origin selects the repository. Omit to use the client workspace, or the process working directory when the client reports no workspace.
     cwd: Option<String>,
 }
 
@@ -143,16 +147,17 @@ impl ArchiveServer {
 #[tool_router]
 impl ArchiveServer {
     #[tool(
-        description = "List coding-agent sessions for one repository, newest first. Local sessions and the R2 archive are merged; the same harness and session id appear once. `cwd` selects the repository by its git origin, not by the recorded path. Omit `cwd` to use this process's working directory. Omit `from` to include every harness in that repository. `limit` and `offset` page the merged list; `total` is the count before paging.",
+        description = "List coding-agent sessions for one repository, newest first. Local sessions and the R2 archive are merged; the same harness and session id appear once. `cwd` selects the repository by its git origin, not by the recorded path. Omit `cwd` to use the client workspace, or this process's working directory when the client reports no workspace. Omit `from` to include every harness in that repository. `limit` and `offset` page the merged list; `total` is the count before paging.",
         annotations(title = "List sessions", read_only_hint = true)
     )]
     async fn list_sessions(
         &self,
         Parameters(request): Parameters<ListSessionsRequest>,
+        peer: Peer<RoleServer>,
     ) -> Result<Json<SessionList>, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
         refuse_live(from)?;
-        let scope = self.open(request.cwd.as_deref(), from).await?;
+        let scope = self.open(request.cwd.as_deref(), from, &peer).await?;
         let total = scope.merged.len();
         let offset = request.offset.unwrap_or(0).min(total);
         let sessions = scope
@@ -170,16 +175,17 @@ impl ArchiveServer {
     }
 
     #[tool(
-        description = "Search coding-agent sessions in one repository for a literal substring. Local sessions and the R2 archive are merged first. `cwd` selects the repository by its git origin. Omit `cwd` to use this process's working directory. Omit `from` to search every harness in that repository.",
+        description = "Search coding-agent sessions in one repository for a literal substring. Local sessions and the R2 archive are merged first. `cwd` selects the repository by its git origin. Omit `cwd` to use the client workspace, or this process's working directory when the client reports no workspace. Omit `from` to search every harness in that repository.",
         annotations(title = "Search sessions", read_only_hint = true)
     )]
     async fn search_sessions(
         &self,
         Parameters(request): Parameters<SearchSessionsRequest>,
+        peer: Peer<RoleServer>,
     ) -> Result<Json<SearchResults>, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
         refuse_live(from)?;
-        let mut scope = self.open(request.cwd.as_deref(), from).await?;
+        let mut scope = self.open(request.cwd.as_deref(), from, &peer).await?;
         let mut index = Index::default();
         for view in scope.merged.clone() {
             let transcript = scope
@@ -223,16 +229,17 @@ impl ArchiveServer {
     }
 
     #[tool(
-        description = "Read one session from the merged local and R2 archive as token-optimized text. `id` is a session id, unambiguous prefix, or exact title. Append `#range` (1-based inclusive, for example `abc#5-12`) to read part of it. Reads over the byte budget are refused with suggested ranges. `from` limits the harness. The repository is this process's working directory.",
+        description = "Read one session from the merged local and R2 archive as token-optimized text. `id` is a session id, unambiguous prefix, or exact title. Append `#range` (1-based inclusive, for example `abc#5-12`) to read part of it. Reads over the byte budget are refused with suggested ranges. `from` limits the harness. The repository is the client workspace, or this process's working directory when the client reports no workspace.",
         annotations(title = "Read session", read_only_hint = true)
     )]
     async fn read_session(
         &self,
         Parameters(request): Parameters<ReadSessionRequest>,
+        peer: Peer<RoleServer>,
     ) -> Result<String, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
         refuse_live(from)?;
-        let mut scope = self.open(None, from).await?;
+        let mut scope = self.open(None, from, &peer).await?;
         let (view, range) = {
             let (view, range) = find_session(&scope.merged, &request.id).map_err(tool_error)?;
             (view.clone(), range)
@@ -252,11 +259,129 @@ impl ArchiveServer {
 }
 
 impl ArchiveServer {
-    async fn open(&self, cwd: Option<&str>, from: Option<HarnessId>) -> Result<Scope, ErrorData> {
-        sessions::open_scope(&self.app.r2, &self.app.key, cwd, from)
+    async fn open(
+        &self,
+        cwd: Option<&str>,
+        from: Option<HarnessId>,
+        peer: &Peer<RoleServer>,
+    ) -> Result<Scope, ErrorData> {
+        let directory = match cwd {
+            Some(cwd) => PathBuf::from(cwd),
+            None => directory_for_omitted_cwd(peer).await.map_err(tool_error)?,
+        };
+        let directory = directory.to_str().ok_or_else(|| {
+            tool_error(Error::msg(format!(
+                "workspace path is not Unicode: {}",
+                directory.display()
+            )))
+        })?;
+        sessions::open_scope(&self.app.r2, &self.app.key, Some(directory), from)
             .await
             .map_err(tool_error)
     }
+}
+
+struct ResolvedRoot {
+    directory: PathBuf,
+    origin: String,
+}
+
+async fn directory_for_omitted_cwd(peer: &Peer<RoleServer>) -> crate::Result<PathBuf> {
+    if client_has_roots(peer) {
+        let roots = list_workspace_roots(peer).await?;
+        if !roots.is_empty() {
+            return directory_from_roots(&roots);
+        }
+    }
+    let process = std::env::current_dir()?;
+    match repo_id::origin_of(&process) {
+        Ok(_) => Ok(process),
+        Err(error) => Err(Error::msg(error.to_string())),
+    }
+}
+
+fn client_has_roots(peer: &Peer<RoleServer>) -> bool {
+    peer.peer_info()
+        .is_some_and(|info| info.capabilities.roots.is_some())
+}
+
+// Cursor starts this process in the home directory and reports the open
+// workspace through roots/list. A root may be a file URI or a bare path.
+#[allow(deprecated)]
+async fn list_workspace_roots(peer: &Peer<RoleServer>) -> crate::Result<Vec<String>> {
+    let listed = peer
+        .list_roots()
+        .await
+        .map_err(|error| Error::msg(format!("listing workspace roots failed: {error}")))?;
+    Ok(listed.roots.into_iter().map(|root| root.uri).collect())
+}
+
+fn directory_from_roots(uris: &[String]) -> crate::Result<PathBuf> {
+    let mut directories = Vec::new();
+    let mut resolved = Vec::new();
+    for uri in uris {
+        let directory = root_directory(uri)?;
+        if let Some(origin) = origin_at(&directory)? {
+            resolved.push(ResolvedRoot { directory, origin });
+        } else {
+            directories.push(directory);
+        }
+    }
+    if resolved.is_empty() {
+        return Err(Error::msg(format!(
+            "workspace roots do not identify a repository: {}",
+            directories
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    one_repository(&resolved)
+}
+
+fn origin_at(dir: &Path) -> crate::Result<Option<String>> {
+    match repo_id::origin_of(dir) {
+        Ok(origin) => Ok(Some(origin)),
+        Err(OriginError::NoOrigin { .. }) => Ok(None),
+        Err(OriginError::GitMissing) => Err(Error::msg("git is not installed")),
+        Err(OriginError::Invalid { message }) => Err(Error::msg(message)),
+    }
+}
+
+fn root_directory(uri: &str) -> crate::Result<PathBuf> {
+    let path = if uri.starts_with("file:") {
+        let url = Url::parse(uri).map_err(|error| {
+            Error::msg(format!("workspace root `{uri}` is not a file URI: {error}"))
+        })?;
+        url.to_file_path()
+            .map_err(|_| Error::msg(format!("workspace root `{uri}` is not a local path")))?
+    } else {
+        PathBuf::from(uri)
+    };
+    if !path.is_absolute() {
+        return Err(Error::msg(format!(
+            "workspace root `{}` is not absolute",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn one_repository(roots: &[ResolvedRoot]) -> crate::Result<PathBuf> {
+    let Some(first) = roots.first() else {
+        return Err(Error::msg("workspace roots do not identify a repository"));
+    };
+    let mut origins: Vec<&str> = roots.iter().map(|root| root.origin.as_str()).collect();
+    origins.sort_unstable();
+    origins.dedup();
+    if origins.len() != 1 {
+        return Err(Error::msg(format!(
+            "workspace roots identify more than one repository: {}",
+            origins.join(", ")
+        )));
+    }
+    Ok(first.directory.clone())
 }
 
 #[allow(unknown_lints, clippy::unused_async_trait_impl)]
@@ -272,7 +397,7 @@ impl ServerHandler for ArchiveServer {
                     ),
             )
             .with_instructions(
-                "Use list_sessions, search_sessions, and read_session. They read this PC's local sessions and the encrypted R2 archive together. cwd is a directory whose git origin selects the repository; omit it to use the process working directory. Append #5-12 to a session id to read that message range.",
+                "Use list_sessions, search_sessions, and read_session. They read this PC's local sessions and the encrypted R2 archive together. cwd is a directory whose git origin selects the repository; omit it to use the client workspace, or the process working directory when the client reports no workspace. Append #5-12 to a session id to read that message range.",
             )
     }
 }
@@ -378,5 +503,62 @@ fn strip_nested_formats(value: &mut serde_json::Value) {
         serde_json::Value::Object(object) => strip_nonstandard_formats(object),
         serde_json::Value::Array(items) => items.iter_mut().for_each(strip_nested_formats),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolved(directory: &str, origin: &str) -> ResolvedRoot {
+        ResolvedRoot {
+            directory: PathBuf::from(directory),
+            origin: origin.into(),
+        }
+    }
+
+    #[test]
+    fn one_workspace_root_selects_that_repository() {
+        let roots = [
+            resolved(r"D:\repo", "https://example.com/repo"),
+            resolved(r"D:\repo\crate", "https://example.com/repo"),
+        ];
+        assert_eq!(one_repository(&roots).unwrap(), PathBuf::from(r"D:\repo"));
+    }
+
+    #[test]
+    fn several_workspace_repositories_are_rejected() {
+        let roots = [
+            resolved(r"D:\a", "https://example.com/a"),
+            resolved(r"D:\b", "https://example.com/b"),
+        ];
+        let error = one_repository(&roots).unwrap_err().to_string();
+        assert!(error.contains("https://example.com/a"), "{error}");
+        assert!(error.contains("https://example.com/b"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_root_accepts_a_file_uri_or_a_bare_path() {
+        assert_eq!(
+            root_directory("file:///D:/Develop/repo").unwrap(),
+            PathBuf::from(r"D:\Develop\repo")
+        );
+        assert_eq!(
+            root_directory("file:///D:/My%20Repo").unwrap(),
+            PathBuf::from(r"D:\My Repo")
+        );
+        assert_eq!(
+            root_directory(r"D:\Develop\repo").unwrap(),
+            PathBuf::from(r"D:\Develop\repo")
+        );
+    }
+
+    #[test]
+    fn a_non_file_workspace_root_is_rejected() {
+        let error = root_directory("https://example.com/repo")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not absolute"), "{error}");
     }
 }

@@ -2,7 +2,7 @@
 
 Cursor、Claude Code、Codex、OpenCode、pi、Antigravity CLI の会話ログを、この PC のローカルストアと Cloudflare R2 の両方から読み取る。R2 に置く本文はアップロード前に暗号化し、バケットは非公開のまま SigV4 で取得する。
 
-MCP は読み取り専用です。書き込み、削除、他ハーネスへの resume やクローンは出しません。`cwd` を省略しても全リポジトリは返しません。プロセスの作業ディレクトリの git `origin` を正規化した repo key で、ローカルと R2 を同時に返します。
+MCP は読み取り専用です。書き込み、削除、他ハーネスへの resume やクローンは出しません。`cwd` を省略しても全リポジトリは返しません。クライアントがワークスペースの root を返したときは、それらが指す一つの git `origin` を正規化した repo key で、ローカルと R2 を同時に返します。root を返さないときは、プロセスの作業ディレクトリの origin を使います。root が複数のリポジトリを指すとき、または origin を解決できないときは失敗します。
 
 ## 範囲
 
@@ -53,7 +53,7 @@ agent-transcript mcp
 - `search_sessions(pattern, from?, cwd?)`
 - `read_session(id, from?)`
 
-`read_session` の範囲は `id#5-12` のように ID へ付けます。`cwd` は記録されたパスとの比較には使わず、そのディレクトリの origin でローカルと R2 の両方を選びます。`read_session` のリポジトリは、プロセスの作業ディレクトリです。
+`read_session` の範囲は `id#5-12` のように ID へ付けます。`cwd` は記録されたパスとの比較には使わず、そのディレクトリの origin でローカルと R2 の両方を選びます。`cwd` を省略した `list_sessions`、`search_sessions`、`read_session` は、クライアントのワークスペース、または root が無いときのプロセスの作業ディレクトリを使います。
 
 Cursor (`~/.cursor/mcp.json`):
 
