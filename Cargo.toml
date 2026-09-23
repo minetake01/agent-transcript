@@ -18,16 +18,16 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rmcp = { version = "2.2", default-features = false, features = ["macros", "server", "transport-io"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 sha2 = "0.10"
 thiserror = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "process", "time"] }
 toml = "0.8"
 txcript = { version = "0.14.4", default-features = false, features = ["search", "opencode", "hermes"] }
 url = "2"
-
-[dev-dependencies]
-tempfile = "3"

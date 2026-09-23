@@ -12,7 +12,8 @@ use agent_transcript::config::{self, InitOptions, Mode};
 #[derive(Parser)]
 #[command(
     name = "agent-transcript",
-    about = "Encrypted coding-agent transcript archive on R2"
+    about = "Encrypted coding-agent transcript archive on R2",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,6 +45,8 @@ enum Command {
     Mcp,
     /// Delete archived objects that the catalog no longer references.
     Gc,
+    /// Download and install a newer verified GitHub release.
+    Update,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -243,5 +246,9 @@ async fn run() -> agent_transcript::Result<()> {
             .await
             .map_err(agent_transcript::Error::msg),
         Command::Gc => agent_transcript::ingest::gc().await,
+        Command::Update => {
+            println!("{}", agent_transcript::update::update().await?);
+            Ok(())
+        }
     }
 }

@@ -16,5 +16,6 @@ mod search_cache;
 pub mod sessions;
 pub mod sources;
 pub mod store;
+pub mod update;
 
 pub use error::{Error, Result};
