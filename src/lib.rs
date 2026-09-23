@@ -12,6 +12,7 @@ pub mod merge;
 pub mod read;
 pub mod remote;
 pub mod repo_id;
+mod search_cache;
 pub mod sessions;
 pub mod sources;
 pub mod store;

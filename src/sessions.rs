@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use txcript::local::Session;
@@ -20,9 +20,36 @@ pub struct Scope {
     pub merged: Vec<MergedView>,
     sessions: HashMap<(HarnessId, String), Session>,
     loaded: HashMap<(HarnessId, String), Transcript<Common>>,
+    fingerprints: HashMap<(HarnessId, String), String>,
 }
 
 impl Scope {
+    pub fn prepare_search_fingerprints(&mut self) {
+        let keys: Vec<_> = self.sessions.keys().cloned().collect();
+        let ordered: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.sessions.remove(key))
+            .collect();
+        let values = local::fingerprints(&ordered);
+        for ((key, session), value) in keys.into_iter().zip(ordered).zip(values) {
+            if !value.is_empty() {
+                self.fingerprints.insert(key.clone(), value);
+            }
+            self.sessions.insert(key, session);
+        }
+    }
+
+    pub fn fingerprint(&self, view: &MergedView) -> Option<String> {
+        match view.pick {
+            Pick::Remote => Some(view.content_hash.clone()),
+            Pick::Local => self
+                .fingerprints
+                .get(&(view.harness, view.session_id.clone()))
+                .cloned(),
+            Pick::Ambiguous => None,
+        }
+    }
+
     pub async fn transcript(
         &mut self,
         r2: &R2,
@@ -116,15 +143,24 @@ fn prepare(repo_key: String, from: Option<HarnessId>, catalog: Catalog) -> Resul
     }
     let locals: Vec<LocalView> = held.iter().map(|item| item.view.clone()).collect();
     let merged = select(&repo_key, from, &locals, &remotes)?;
+    let selected: HashSet<_> = merged
+        .iter()
+        .filter(|view| view.pick == Pick::Local)
+        .map(|view| (view.harness, view.session_id.clone()))
+        .collect();
     let mut sessions = HashMap::new();
     for item in held {
-        sessions.insert((item.view.harness, item.view.session_id), item.session);
+        let identity = (item.view.harness, item.view.session_id);
+        if selected.contains(&identity) {
+            sessions.insert(identity, item.session);
+        }
     }
     Ok(Scope {
         repo_key,
         merged,
         sessions,
         loaded,
+        fingerprints: HashMap::new(),
     })
 }
 

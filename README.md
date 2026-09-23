@@ -12,7 +12,7 @@ MCP は読み取り専用です。書き込み、削除、他ハーネスへの 
 
 ## 設定
 
-設定と復号鍵はリポジトリの外に置きます。Windows では `%APPDATA%\agent-transcript\config.toml` と `%APPDATA%\agent-transcript\key` です。復号キャッシュは `%LOCALAPPDATA%\agent-transcript\cache` です。`AGENT_TRANSCRIPT_HOME` を置くと、そのディレクトリを設定場所にします。
+設定と復号鍵はリポジトリの外に置きます。Windows では `%APPDATA%\agent-transcript\config.toml` と `%APPDATA%\agent-transcript\key` です。復号キャッシュは `%LOCALAPPDATA%\agent-transcript\cache` です。検索結果ではなくセッションごとの検索用テキストも `cache/search` に保存します。更新されたセッションの項目は差し替えられ、検索キャッシュは最大 256 MiB、復号キャッシュは最大 512 MiB、どちらも最後の利用から 30 日経つと次回の検索・書き込み時に削除します。キャッシュは平文なので、このディレクトリへのアクセス権に注意してください。`AGENT_TRANSCRIPT_HOME` を置くと、そのディレクトリを設定場所にします。
 
 R2 の API トークンはバケット専用にします。読み取り専用の PC では Object Read だけのトークンを作り、`mode` を `read` にします。そのモードでは `ingest` と `gc` はリクエストを出さずに失敗します。
 

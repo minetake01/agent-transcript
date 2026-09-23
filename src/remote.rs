@@ -51,6 +51,9 @@ pub async fn load_plaintext(
     let cached = cache_dir.join(format!("{content_hash}.json"));
     if let Ok(bytes) = fs::read(&cached) {
         if hash_bytes(&bytes) == content_hash {
+            if let Ok(handle) = fs::OpenOptions::new().write(true).open(&cached) {
+                let _ = handle.set_modified(std::time::SystemTime::now());
+            }
             return Ok(bytes);
         }
         fs::remove_file(&cached)?;
@@ -67,6 +70,7 @@ pub async fn load_plaintext(
     }
     fs::create_dir_all(cache_dir)?;
     fs::write(&cached, &plain)?;
+    crate::search_cache::prune_plaintext(cache_dir);
     Ok(plain)
 }
 

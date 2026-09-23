@@ -10,7 +10,7 @@ use rmcp::{
     ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use txcript::search::{Case, DocKey, Hit, Index, Origin, Query};
+use txcript::search::{Case, DocKey, Extracted, Hit, Index, Origin, Query};
 use txcript::HarnessId;
 use url::Url;
 
@@ -19,6 +19,7 @@ use crate::error::Error;
 use crate::fragment::parse_ref;
 use crate::read;
 use crate::repo_id::{self, OriginError};
+use crate::search_cache;
 use crate::sessions::{self, find_session, Scope};
 use crate::store::R2;
 
@@ -186,21 +187,46 @@ impl ArchiveServer {
         let from = parse_from(request.from.as_deref())?;
         refuse_live(from)?;
         let mut scope = self.open(request.cwd.as_deref(), from, &peer).await?;
+        scope.prepare_search_fingerprints();
         let mut index = Index::default();
         for view in scope.merged.clone() {
+            let doc_key = DocKey {
+                harness: view.harness,
+                id: view.session_id.clone(),
+                source: None,
+            };
+            let fingerprint = scope.fingerprint(&view);
+            if let Some(extracted) = fingerprint.as_deref().and_then(|fingerprint| {
+                search_cache::get(
+                    &self.app.cache_dir,
+                    &scope.repo_key,
+                    &view,
+                    fingerprint,
+                    &doc_key,
+                )
+            }) {
+                index.insert_extracted(extracted);
+                continue;
+            }
             let transcript = scope
                 .transcript(&self.app.r2, &self.app.key, &self.app.cache_dir, &view)
                 .await
                 .map_err(tool_error)?;
-            index.insert(
-                DocKey {
-                    harness: view.harness,
-                    id: view.session_id.clone(),
-                    source: None,
-                },
-                &transcript,
-            );
+            let extracted = Extracted::new(doc_key.clone(), &transcript);
+            if let Some(fingerprint) = fingerprint {
+                search_cache::put(
+                    &self.app.cache_dir,
+                    &scope.repo_key,
+                    &view,
+                    &fingerprint,
+                    doc_key,
+                    &extracted,
+                );
+            }
+            index.insert_extracted(extracted);
         }
+        search_cache::prune(&self.app.cache_dir);
+        search_cache::prune_plaintext(&self.app.cache_dir);
         let mut query = Query::substring(request.pattern);
         query.case = Case::Insensitive;
         query.limit = Some(20);
