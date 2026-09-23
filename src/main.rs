@@ -45,6 +45,12 @@ enum Command {
     Mcp,
     /// Delete archived objects that the catalog no longer references.
     Gc,
+    /// Build the durable search index for a repository.
+    Index {
+        /// Repository directory. Omit to use the process working directory.
+        #[arg(long)]
+        cwd: Option<String>,
+    },
     /// Download and install a newer verified GitHub release.
     Update,
 }
@@ -246,6 +252,51 @@ async fn run() -> agent_transcript::Result<()> {
             .await
             .map_err(agent_transcript::Error::msg),
         Command::Gc => agent_transcript::ingest::gc().await,
+        Command::Index { cwd } => {
+            let config = config::load_config()?;
+            let key = config::load_key()?;
+            let cache_dir = config::cache_dir()?;
+            let r2 = agent_transcript::store::R2::new(&config);
+            let can_write = config.mode == config::Mode::Readwrite;
+            let snapshot = if can_write {
+                agent_transcript::search_index::build_for_cwd(
+                    &r2,
+                    &key,
+                    &cache_dir,
+                    cwd.as_deref(),
+                    true,
+                )
+                .await?
+            } else {
+                match agent_transcript::search_index::download_for_cwd(
+                    &r2,
+                    &key,
+                    &cache_dir,
+                    cwd.as_deref(),
+                )
+                .await?
+                {
+                    Some(snapshot) => snapshot,
+                    None => {
+                        agent_transcript::search_index::build_for_cwd(
+                            &r2,
+                            &key,
+                            &cache_dir,
+                            cwd.as_deref(),
+                            false,
+                        )
+                        .await?
+                    }
+                }
+            };
+            println!(
+                "search index generation {} is ready with {} session(s) for {}",
+                snapshot.generation(),
+                snapshot.documents(),
+                snapshot.repo_key()
+            );
+            Ok(())
+        }
         Command::Update => {
             println!("{}", agent_transcript::update::update().await?);
             Ok(())

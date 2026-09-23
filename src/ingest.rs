@@ -14,6 +14,7 @@ use crate::document::{encrypt_document, ArchiveDocument};
 use crate::error::{Error, Result};
 use crate::remote::{commit_catalog, load_catalog};
 use crate::repo_id::{RepoCache, SessionRepo};
+use crate::search_index;
 use crate::sources::{self, Candidate, LoadFailure};
 use crate::store::{Precondition, R2};
 use txcript::HarnessId;
@@ -37,6 +38,8 @@ struct Scan {
     broken: Vec<String>,
     transient: Vec<String>,
     generations: BTreeMap<String, String>,
+    changed_dirs: BTreeMap<String, PathBuf>,
+    all_dirs: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,8 +88,29 @@ pub async fn ingest() -> Result<()> {
         r2.put(&upload.object_key, upload.blob.clone(), Precondition::None)
             .await?;
     }
-    commit_catalog(&r2, &config::load_key()?, &scan.incoming).await?;
+    let index_key = config::load_key()?;
+    commit_catalog(&r2, &index_key, &scan.incoming).await?;
     save_cursors(&cursors_path, &scan.cursors)?;
+
+    // Rebuild changed repositories and initialize any repository that has no
+    // durable search snapshot yet. This is deliberately outside the MCP
+    // request path; the next search reads the resulting snapshot directly.
+    let cache_dir = config::cache_dir()?;
+    let mut index_dirs = scan.changed_dirs.clone();
+    for (repo_key, directory) in &scan.all_dirs {
+        if !index_dirs.contains_key(repo_key)
+            && !search_index::local_path(&cache_dir, repo_key).is_file()
+        {
+            index_dirs.insert(repo_key.clone(), directory.clone());
+        }
+    }
+    for directory in index_dirs.values() {
+        if let Err(error) =
+            search_index::build_for_directory(&r2, &index_key, &cache_dir, directory, true).await
+        {
+            eprintln!("agent-transcript: search index refresh failed: {error}");
+        }
+    }
     println!(
         "uploaded {} session(s), unchanged {}, read {}, missing cwd {}",
         scan.uploads.len(),
@@ -126,6 +150,17 @@ pub async fn gc() -> Result<()> {
     let mut deleted = 0usize;
     for key in r2.list("v1/objects/").await? {
         if !live.contains(&key) {
+            r2.delete(&key).await?;
+            deleted += 1;
+        }
+    }
+    let live_indexes = catalog
+        .sessions
+        .iter()
+        .map(|session| search_index::remote_key(&session.repo_key))
+        .collect::<HashSet<_>>();
+    for key in r2.list("v1/search/").await? {
+        if !live_indexes.contains(&key) {
             r2.delete(&key).await?;
             deleted += 1;
         }
@@ -195,6 +230,8 @@ fn scan(mut cursors: CursorSet, catalog: Catalog, key: Key) -> Result<Scan> {
         broken: Vec::new(),
         transient: Vec::new(),
         generations: collected.generations,
+        changed_dirs: BTreeMap::new(),
+        all_dirs: BTreeMap::new(),
     };
     for candidate in changes {
         match sources::load(&candidate) {
@@ -217,7 +254,27 @@ fn scan(mut cursors: CursorSet, catalog: Catalog, key: Key) -> Result<Scan> {
     if scan.transient.is_empty() {
         scan.cursors.stores.extend(scan.generations.clone());
     }
+    collect_index_dirs(&mut scan)?;
     Ok(scan)
+}
+
+fn collect_index_dirs(scan: &mut Scan) -> Result<()> {
+    let mut repos = RepoCache::default();
+    for stored in scan.cursors.sessions.values() {
+        let Some(cwd) = nonempty(&stored.cwd) else {
+            continue;
+        };
+        let path = Path::new(cwd);
+        if !path.is_dir() {
+            continue;
+        }
+        if let SessionRepo::Key(repo_key) = repos.resolve(Some(cwd))? {
+            scan.all_dirs
+                .entry(repo_key)
+                .or_insert_with(|| path.to_path_buf());
+        }
+    }
+    Ok(())
 }
 
 fn step_of(
@@ -346,6 +403,10 @@ fn push_loaded(
                 .push(format!("{harness} {session_id} — {reason}"));
         }
         SessionRepo::Key(repo_key) => {
+            if !cwd.is_empty() && Path::new(&cwd).is_dir() {
+                scan.changed_dirs
+                    .insert(repo_key.clone(), PathBuf::from(&cwd));
+            }
             let document = ArchiveDocument::new(harness, repo_key.clone(), loaded.transcript);
             let hash = document.content_hash()?;
             if known.contains(&(harness, session_id.clone(), hash.clone())) {

@@ -12,7 +12,7 @@ MCP は読み取り専用です。書き込み、削除、他ハーネスへの 
 
 ## 設定
 
-設定と復号鍵はリポジトリの外に置きます。Windows では `%APPDATA%\agent-transcript\config.toml` と `%APPDATA%\agent-transcript\key` です。復号キャッシュは `%LOCALAPPDATA%\agent-transcript\cache` です。検索結果ではなくセッションごとの検索用テキストも `cache/search` に保存します。更新されたセッションの項目は差し替えられ、検索キャッシュは最大 256 MiB、復号キャッシュは最大 512 MiB、どちらも最後の利用から 30 日経つと次回の検索・書き込み時に削除します。キャッシュは平文なので、このディレクトリへのアクセス権に注意してください。`AGENT_TRANSCRIPT_HOME` を置くと、そのディレクトリを設定場所にします。
+設定と復号鍵はリポジトリの外に置きます。Windows では `%APPDATA%\agent-transcript\config.toml` と `%APPDATA%\agent-transcript\key` です。復号キャッシュは `%LOCALAPPDATA%\agent-transcript\cache` です。検索結果ではなくセッションごとの検索用テキストも `cache/search` に保存します。検索用の完全なスナップショットは `cache/search-index` に保存し、read/write 環境では暗号化したものを R2 の `v1/search` にも保存します。完全な検索インデックスは古いセッションを保持するため LRU で削除しません。更新されたセッションの項目は差し替えられ、補助的な検索キャッシュは最大 256 MiB、復号キャッシュは最大 512 MiB、どちらも最後の利用から 30 日経つと次回の検索・書き込み時に削除します。キャッシュは平文なので、このディレクトリへのアクセス権に注意してください。`AGENT_TRANSCRIPT_HOME` を置くと、そのディレクトリを設定場所にします。
 
 R2 の API トークンはバケット専用にします。読み取り専用の PC では Object Read だけのトークンを作り、`mode` を `read` にします。そのモードでは `ingest` と `gc` はリクエストを出さずに失敗します。
 
@@ -34,6 +34,7 @@ agent-transcript install
 agent-transcript ingest
 agent-transcript watch
 agent-transcript gc
+agent-transcript index
 agent-transcript mcp
 agent-transcript update
 ```
@@ -47,6 +48,8 @@ agent-transcript update
 `ingest` はハーネスごとにストアの世代を見ます。世代が前回と同じで、記録した内容ハッシュがすべてカタログにあれば、そのストアは開きません。世代が変わったストアだけを discover し、指紋が空か前回と違うソースだけ本文を開きます。指紋が一致してもカタログにその内容ハッシュが無いソースは開き直して送ります。カタログにある内容ハッシュは送りません。
 
 `watch` は同じ確認をすぐ 1 回行い、その後は 5 分おきに同じプロセスで繰り返します。優先度は通常より低くします。カタログが参照しなくなったオブジェクトは `gc` で削除します。
+
+`index` は指定したリポジトリ（省略時は現在の作業ディレクトリ）の全セッションを検索用に抽出し、ローカルの `cache/search-index` に保存します。read/write モードでは、同じスナップショットを暗号化して R2 の `v1/search` にも保存します。`ingest` で変更されたリポジトリも自動的に更新されます。既存環境では、最初は `agent-transcript index` を一度実行してください。R2 のスナップショットを暗号鍵ごと別の read-only PC にコピーすると、その PC でも全履歴を事前構築なしで検索できます。MCP はローカルスナップショットをメモリに保持し、検索のたびに R2カタログや全ローカルセッションを読み直しません。
 
 ## MCP
 

@@ -82,7 +82,7 @@ fn task_xml(exe: &std::path::Path, user: &str) -> String {
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Upload new and changed coding-agent transcripts every 5 minutes.</Description>
+    <Description>Upload changed coding-agent transcripts and maintain the durable search index every 5 minutes.</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>

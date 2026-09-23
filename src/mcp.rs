@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
+use chrono::Utc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{Implementation, JsonObject, ServerCapabilities, ServerInfo};
@@ -10,7 +13,7 @@ use rmcp::{
     ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use txcript::search::{Case, DocKey, Extracted, Hit, Index, Origin, Query};
+use txcript::search::{Case, Hit, Origin, Query};
 use txcript::HarnessId;
 use url::Url;
 
@@ -19,10 +22,11 @@ use crate::error::Error;
 use crate::fragment::parse_ref;
 use crate::read;
 use crate::repo_id::{self, OriginError};
-use crate::search_cache;
+use crate::search_index;
 use crate::sessions::{self, find_session, Scope};
 use crate::store::R2;
 
+const SEARCH_INDEX_MAX_AGE: i64 = 5 * 60;
 const STANDARD_FORMATS: &[&str] = &[
     "date",
     "date-time",
@@ -121,6 +125,9 @@ struct App {
     r2: R2,
     key: crate::crypto::Key,
     cache_dir: std::path::PathBuf,
+    can_write: bool,
+    search_indexes: RwLock<HashMap<String, Arc<search_index::Runtime>>>,
+    refreshing: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -186,72 +193,66 @@ impl ArchiveServer {
     ) -> Result<Json<SearchResults>, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
         refuse_live(from)?;
-        let mut scope = self.open(request.cwd.as_deref(), from, &peer).await?;
-        scope.prepare_search_fingerprints();
-        let mut index = Index::default();
-        for view in scope.merged.clone() {
-            let doc_key = DocKey {
-                harness: view.harness,
-                id: view.session_id.clone(),
-                source: None,
-            };
-            let fingerprint = scope.fingerprint(&view);
-            if let Some(extracted) = fingerprint.as_deref().and_then(|fingerprint| {
-                search_cache::get(
-                    &self.app.cache_dir,
-                    &scope.repo_key,
-                    &view,
-                    fingerprint,
-                    &doc_key,
-                )
-            }) {
-                index.insert_extracted(extracted);
-                continue;
-            }
-            let transcript = scope
-                .transcript(&self.app.r2, &self.app.key, &self.app.cache_dir, &view)
-                .await
-                .map_err(tool_error)?;
-            let extracted = Extracted::new(doc_key.clone(), &transcript);
-            if let Some(fingerprint) = fingerprint {
-                search_cache::put(
-                    &self.app.cache_dir,
-                    &scope.repo_key,
-                    &view,
-                    &fingerprint,
-                    doc_key,
-                    &extracted,
-                );
-            }
-            index.insert_extracted(extracted);
+        let directory = self
+            .workspace_directory(request.cwd.as_deref(), &peer)
+            .await?;
+        let repo_key = self.repo_key(&directory)?;
+
+        // The normal path is entirely local: load the durable snapshot once,
+        // then query the in-memory index. No catalog request, local discovery,
+        // transcript parsing, or cache-directory scan is needed here.
+        if let Some(runtime) = self.search_runtime(&repo_key).await {
+            self.refresh_if_stale(&directory, &repo_key, &runtime);
+            return Ok(Json(query_runtime(runtime, request.pattern, from)));
         }
-        search_cache::prune(&self.app.cache_dir);
-        search_cache::prune_plaintext(&self.app.cache_dir);
-        let mut query = Query::substring(request.pattern);
-        query.case = Case::Insensitive;
-        query.limit = Some(20);
-        query.hits_per_doc = Some(3);
-        if let Some(harness) = from {
-            query.harnesses = Some(vec![harness]);
+
+        // If this PC has never downloaded the index, try the encrypted R2 copy
+        // briefly. The timeout is deliberate: a slow network must not turn a
+        // local query into an unbounded wait. The legacy path below preserves
+        // correctness when neither copy is available yet.
+        let remote = tokio::time::timeout(
+            Duration::from_millis(900),
+            search_index::load_remote(&self.app.r2, &self.app.key, &self.app.cache_dir, &repo_key),
+        )
+        .await;
+        if let Ok(Ok(Some(snapshot))) = remote {
+            let runtime = Arc::new(snapshot.into_runtime());
+            self.remember_runtime(&repo_key, Arc::clone(&runtime));
+            self.refresh_if_stale(&directory, &repo_key, &runtime);
+            return Ok(Json(query_runtime(runtime, request.pattern, from)));
         }
-        let matches = index
-            .query(&query)
-            .iter()
-            .map(|found| SearchMatch {
-                session: SessionSummary {
-                    harness: found.key.harness.to_string(),
-                    id: found.key.id.clone(),
-                    timestamp: found.meta.timestamp.to_rfc3339(),
-                    title: found.meta.title.clone(),
-                    cwd: found.meta.cwd.clone(),
-                    git_branch: found.meta.git_branch.clone(),
-                    model: found.meta.model.clone(),
-                },
-                score: found.score,
-                hits: found.hits.iter().map(SearchHit::from).collect(),
-            })
-            .collect();
-        Ok(Json(SearchResults { matches }))
+
+        // Cold path: build a complete local snapshot and answer from it. This
+        // is the only path that may read every transcript; subsequent queries
+        // use the fast path above.
+        // Build the repository-wide snapshot even when this request selected a
+        // single harness; otherwise a filtered first query would poison the
+        // durable index for later unfiltered searches.
+        let scope = self.open_directory(&directory, None).await?;
+        let snapshot = search_index::Snapshot::from_scope(
+            scope,
+            &self.app.r2,
+            &self.app.key,
+            &self.app.cache_dir,
+        )
+        .await
+        .map_err(tool_error)?;
+        if self.app.can_write {
+            let plain = snapshot.to_bytes().map_err(tool_error)?;
+            let r2 = self.app.r2.clone();
+            let key = self.app.key;
+            let repo = repo_key.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    search_index::publish_remote_bytes(&r2, &key, &repo, &plain).await
+                {
+                    eprintln!("agent-transcript: publishing search index failed: {error}");
+                }
+            });
+        }
+        let runtime = Arc::new(snapshot.into_runtime());
+        self.remember_runtime(&repo_key, Arc::clone(&runtime));
+        Ok(Json(query_runtime(runtime, request.pattern, from)))
     }
 
     #[tool(
@@ -291,10 +292,30 @@ impl ArchiveServer {
         from: Option<HarnessId>,
         peer: &Peer<RoleServer>,
     ) -> Result<Scope, ErrorData> {
-        let directory = match cwd {
-            Some(cwd) => PathBuf::from(cwd),
-            None => directory_for_omitted_cwd(peer).await.map_err(tool_error)?,
-        };
+        let directory = self.workspace_directory(cwd, peer).await?;
+        self.open_directory(&directory, from).await
+    }
+
+    async fn workspace_directory(
+        &self,
+        cwd: Option<&str>,
+        peer: &Peer<RoleServer>,
+    ) -> Result<PathBuf, ErrorData> {
+        match cwd {
+            Some(cwd) => Ok(PathBuf::from(cwd)),
+            None => directory_for_omitted_cwd(peer).await.map_err(tool_error),
+        }
+    }
+
+    fn repo_key(&self, directory: &Path) -> Result<String, ErrorData> {
+        repo_id::origin_of(directory).map_err(|error| tool_error(Error::msg(error.to_string())))
+    }
+
+    async fn open_directory(
+        &self,
+        directory: &Path,
+        from: Option<HarnessId>,
+    ) -> Result<Scope, ErrorData> {
         let directory = directory.to_str().ok_or_else(|| {
             tool_error(Error::msg(format!(
                 "workspace path is not Unicode: {}",
@@ -304,6 +325,90 @@ impl ArchiveServer {
         sessions::open_scope(&self.app.r2, &self.app.key, Some(directory), from)
             .await
             .map_err(tool_error)
+    }
+
+    async fn search_runtime(&self, repo_key: &str) -> Option<Arc<search_index::Runtime>> {
+        if let Some(runtime) = self
+            .app
+            .search_indexes
+            .read()
+            .ok()
+            .and_then(|indexes| indexes.get(repo_key).cloned())
+        {
+            return Some(runtime);
+        }
+        let snapshot = search_index::load_local(&self.app.cache_dir, repo_key).ok()??;
+        let runtime = Arc::new(snapshot.into_runtime());
+        self.remember_runtime(repo_key, Arc::clone(&runtime));
+        Some(runtime)
+    }
+
+    fn refresh_if_stale(&self, directory: &Path, repo_key: &str, runtime: &search_index::Runtime) {
+        let age = Utc::now()
+            .signed_duration_since(runtime.generated_at())
+            .num_seconds();
+        if age < SEARCH_INDEX_MAX_AGE {
+            return;
+        }
+        let Ok(mut refreshing) = self.app.refreshing.lock() else {
+            return;
+        };
+        if !refreshing.insert(repo_key.to_string()) {
+            return;
+        }
+        drop(refreshing);
+
+        let app = Arc::clone(&self.app);
+        let directory = directory.to_path_buf();
+        let repo_key = repo_key.to_string();
+        tokio::spawn(async move {
+            let result = if app.can_write {
+                search_index::build_for_directory(
+                    &app.r2,
+                    &app.key,
+                    &app.cache_dir,
+                    &directory,
+                    true,
+                )
+                .await
+            } else {
+                match search_index::load_remote(&app.r2, &app.key, &app.cache_dir, &repo_key).await
+                {
+                    Ok(Some(snapshot)) => Ok(snapshot),
+                    Ok(None) => {
+                        search_index::build_for_directory(
+                            &app.r2,
+                            &app.key,
+                            &app.cache_dir,
+                            &directory,
+                            false,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            match result {
+                Ok(snapshot) => {
+                    let runtime = Arc::new(snapshot.into_runtime());
+                    if let Ok(mut indexes) = app.search_indexes.write() {
+                        indexes.insert(repo_key.clone(), runtime);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("agent-transcript: search index refresh failed: {error}");
+                }
+            }
+            if let Ok(mut refreshing) = app.refreshing.lock() {
+                refreshing.remove(&repo_key);
+            }
+        });
+    }
+
+    fn remember_runtime(&self, repo_key: &str, runtime: Arc<search_index::Runtime>) {
+        if let Ok(mut indexes) = self.app.search_indexes.write() {
+            indexes.insert(repo_key.to_string(), runtime);
+        }
     }
 }
 
@@ -436,6 +541,9 @@ pub async fn serve() -> Result<(), String> {
         r2: R2::new(&config),
         key,
         cache_dir,
+        can_write: config.mode == config::Mode::Readwrite,
+        search_indexes: RwLock::new(HashMap::new()),
+        refreshing: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
     let service = server
         .serve(stdio())
@@ -446,6 +554,39 @@ pub async fn serve() -> Result<(), String> {
         .await
         .map_err(|error| format!("running MCP stdio server: {error}"))?;
     Ok(())
+}
+
+fn query_runtime(
+    runtime: Arc<search_index::Runtime>,
+    pattern: String,
+    from: Option<HarnessId>,
+) -> SearchResults {
+    let mut query = Query::substring(pattern);
+    query.case = Case::Insensitive;
+    query.limit = Some(20);
+    query.hits_per_doc = Some(3);
+    if let Some(harness) = from {
+        query.harnesses = Some(vec![harness]);
+    }
+    let matches = runtime
+        .index
+        .query(&query)
+        .iter()
+        .map(|found| SearchMatch {
+            session: SessionSummary {
+                harness: found.key.harness.to_string(),
+                id: found.key.id.clone(),
+                timestamp: found.meta.timestamp.to_rfc3339(),
+                title: found.meta.title.clone(),
+                cwd: found.meta.cwd.clone(),
+                git_branch: found.meta.git_branch.clone(),
+                model: found.meta.model.clone(),
+            },
+            score: found.score,
+            hits: found.hits.iter().map(SearchHit::from).collect(),
+        })
+        .collect();
+    SearchResults { matches }
 }
 
 fn summary(view: &crate::merge::MergedView) -> SessionSummary {

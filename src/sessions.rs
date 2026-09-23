@@ -17,6 +17,7 @@ use crate::store::R2;
 
 pub struct Scope {
     pub repo_key: String,
+    pub catalog_etag: Option<String>,
     pub merged: Vec<MergedView>,
     sessions: HashMap<(HarnessId, String), Session>,
     loaded: HashMap<(HarnessId, String), Transcript<Common>>,
@@ -113,15 +114,28 @@ pub async fn open_scope(
     }
     let repo_key =
         crate::repo_id::origin_of(&dir).map_err(|error| Error::msg(error.to_string()))?;
-    let (catalog, _) = crate::remote::load_catalog(r2, key).await?;
+    let (catalog, catalog_etag) = crate::remote::load_catalog(r2, key).await?;
     let repo_for_thread = repo_key.clone();
     let catalog_for_thread = catalog.clone();
-    tokio::task::spawn_blocking(move || prepare(repo_for_thread, from, catalog_for_thread))
-        .await
-        .map_err(|error| Error::msg(format!("scanning local sessions: {error}")))?
+    let catalog_etag_for_thread = catalog_etag.clone();
+    tokio::task::spawn_blocking(move || {
+        prepare(
+            repo_for_thread,
+            from,
+            catalog_for_thread,
+            catalog_etag_for_thread,
+        )
+    })
+    .await
+    .map_err(|error| Error::msg(format!("scanning local sessions: {error}")))?
 }
 
-fn prepare(repo_key: String, from: Option<HarnessId>, catalog: Catalog) -> Result<Scope> {
+fn prepare(
+    repo_key: String,
+    from: Option<HarnessId>,
+    catalog: Catalog,
+    catalog_etag: Option<String>,
+) -> Result<Scope> {
     let remotes = remote_views(&catalog)?;
     let mut held = discover_held()?;
     held = dedupe_locals(held)?;
@@ -157,6 +171,7 @@ fn prepare(repo_key: String, from: Option<HarnessId>, catalog: Catalog) -> Resul
     }
     Ok(Scope {
         repo_key,
+        catalog_etag,
         merged,
         sessions,
         loaded,

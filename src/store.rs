@@ -19,6 +19,7 @@ pub enum Precondition {
     IfNoneMatchStar,
 }
 
+#[derive(Clone)]
 pub struct R2 {
     client: Client,
     bucket: String,
