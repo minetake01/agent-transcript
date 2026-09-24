@@ -6,7 +6,7 @@ use std::time::Duration;
 use chrono::Utc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{Implementation, JsonObject, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, JsonObject, ServerCapabilities, ServerConfig};
 use rmcp::schemars::JsonSchema;
 use rmcp::{
     tool, tool_handler, tool_router, transport::stdio, ErrorData, Peer, RoleServer, ServerHandler,
@@ -518,8 +518,9 @@ fn one_repository(roots: &[ResolvedRoot]) -> crate::Result<PathBuf> {
 #[allow(unknown_lints, clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ArchiveServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        // rmcp 3 dual-era: default discover + initialize; do not narrow supported versions.
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("agent-transcript", env!("CARGO_PKG_VERSION"))
                     .with_title("agent transcript archive")
