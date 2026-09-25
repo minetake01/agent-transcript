@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
+use txcript::harness::antigravity;
 use txcript::local::Session;
-use txcript::{local, Common, HarnessId, Transcript};
+use txcript::{local, Codec, Common, HarnessId, Store, Transcript};
 
 use crate::catalog::Catalog;
 use crate::crypto::Key;
@@ -15,11 +17,32 @@ use crate::remote::{document_from_plaintext, load_plaintext};
 use crate::repo_id::{scope_directory, RepoCache, SessionRepo};
 use crate::store::R2;
 
+enum LocalSource {
+    Txcript(Session),
+    Antigravity {
+        store: antigravity::AntigravityStore,
+        reference: PathBuf,
+    },
+}
+
+impl LocalSource {
+    fn read(&self) -> Result<Transcript<Common>> {
+        match self {
+            Self::Txcript(session) => session.read().map_err(|e| Error::msg(e.to_string())),
+            Self::Antigravity { store, reference } => {
+                let native = store.load(reference).map_err(|e| Error::msg(e.to_string()))?;
+                <antigravity::Antigravity as Codec>::to_common(&native)
+                    .map_err(|e| Error::msg(e.to_string()))
+            }
+        }
+    }
+}
+
 pub struct Scope {
     pub repo_key: String,
     pub catalog_etag: Option<String>,
     pub merged: Vec<MergedView>,
-    sessions: HashMap<(HarnessId, String), Session>,
+    sessions: HashMap<(HarnessId, String), LocalSource>,
     loaded: HashMap<(HarnessId, String), Transcript<Common>>,
     fingerprints: HashMap<(HarnessId, String), String>,
 }
@@ -27,16 +50,42 @@ pub struct Scope {
 impl Scope {
     pub fn prepare_search_fingerprints(&mut self) {
         let keys: Vec<_> = self.sessions.keys().cloned().collect();
-        let ordered: Vec<_> = keys
-            .iter()
-            .filter_map(|key| self.sessions.remove(key))
-            .collect();
-        let values = local::fingerprints(&ordered);
-        for ((key, session), value) in keys.into_iter().zip(ordered).zip(values) {
+        let mut txcript_keys = Vec::new();
+        let mut txcript_sessions = Vec::new();
+        let mut ag_keys_sources = Vec::new();
+
+        for key in keys {
+            if let Some(source) = self.sessions.remove(&key) {
+                match source {
+                    LocalSource::Txcript(session) => {
+                        txcript_keys.push(key);
+                        txcript_sessions.push(session);
+                    }
+                    LocalSource::Antigravity { store, reference } => {
+                        ag_keys_sources.push((key, store, reference));
+                    }
+                }
+            }
+        }
+
+        let values = local::fingerprints(&txcript_sessions);
+        for ((key, session), value) in txcript_keys.into_iter().zip(txcript_sessions).zip(values) {
             if !value.is_empty() {
                 self.fingerprints.insert(key.clone(), value);
             }
-            self.sessions.insert(key, session);
+            self.sessions.insert(key, LocalSource::Txcript(session));
+        }
+
+        for (key, store, reference) in ag_keys_sources {
+            if let Ok(mut map) = store.fingerprints(&[reference.clone()]) {
+                if let Some(fp) = map.remove(&reference.to_string_lossy().into_owned()) {
+                    if !fp.is_empty() {
+                        self.fingerprints.insert(key.clone(), fp);
+                    }
+                }
+            }
+            self.sessions
+                .insert(key, LocalSource::Antigravity { store, reference });
         }
     }
 
@@ -180,7 +229,7 @@ fn prepare(
 }
 
 struct Held {
-    session: Session,
+    session: LocalSource,
     view: LocalView,
 }
 
@@ -212,8 +261,55 @@ fn discover_held() -> Result<Vec<Held>> {
             git_branch: session.meta.git_branch.clone(),
             model: session.meta.model.clone(),
         };
-        held.push(Held { session, view });
+        held.push(Held {
+            session: LocalSource::Txcript(session),
+            view,
+        });
     }
+
+    // Also discover Antigravity IDE sessions that local::discover() skips
+    for store in crate::sources::antigravity_stores() {
+        if let Some(default) = antigravity::AntigravityStore::default_root() {
+            if store.root == default.root {
+                continue;
+            }
+        }
+        for d in store.discover().unwrap_or_default() {
+            let repo = repos.resolve(d.meta.cwd.as_deref())?;
+            let repo_key = match repo {
+                SessionRepo::Key(key) => Some(key),
+                SessionRepo::MissingCwd | SessionRepo::Unresolved(_) => None,
+            };
+            let updated_at = std::fs::metadata(&d.reference)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(DateTime::<Utc>::from);
+            let view = LocalView {
+                harness: HarnessId::Antigravity,
+                session_id: d.meta.id.clone(),
+                repo_key,
+                freshness: Freshness {
+                    updated_at,
+                    last_message_at: None,
+                    message_count: 0,
+                    content_hash: String::new(),
+                },
+                started_at: d.meta.timestamp,
+                title: d.meta.title.clone(),
+                cwd: d.meta.cwd.clone(),
+                git_branch: d.meta.git_branch.clone(),
+                model: d.meta.model.clone(),
+            };
+            held.push(Held {
+                session: LocalSource::Antigravity {
+                    store: store.clone(),
+                    reference: d.reference,
+                },
+                view,
+            });
+        }
+    }
+
     Ok(held)
 }
 

@@ -44,6 +44,16 @@ impl Config {
     }
 }
 
+pub fn user_home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    home.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 pub fn home_dir() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("AGENT_TRANSCRIPT_HOME") {
         return Ok(PathBuf::from(home));

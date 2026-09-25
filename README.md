@@ -6,7 +6,7 @@ MCP は読み取り専用です。書き込み、削除、他ハーネスへの 
 
 ## 範囲
 
-取り込むのは [txcript](https://docs.rs/txcript) がローカルストアとして読むセッションです。Antigravity の IDE が書く `.pb` 会話と、Claude Chat / ChatGPT のライブ API は対象外です。
+取り込むのは [txcript](https://docs.rs/txcript) がローカルストアとして読むセッション、および Antigravity のセッションデータベース（`.db`）です。Claude Chat / ChatGPT のライブ API は対象外です。
 
 同じ `harness` と `session_id` がローカルと R2 の両方にあるときは 1 件にまとめ、新しい方の本文を使います。新しさは `updated_at`、無ければ最終メッセージ時刻、それでも同じならメッセージ数です。そこまで同じで本文が違うセッションは、本文の取得をエラーにします。
 
@@ -59,7 +59,7 @@ agent-transcript update
 
 - `list_sessions(from?, cwd?, limit?, offset?)`
 - `search_sessions(pattern, from?, cwd?)`
-- `read_session(id, from?)`
+- `read_session(id, from?, cwd?)`
 
 `read_session` の範囲は `id#5-12` のように ID へ付けます。`cwd` は記録されたパスとの比較には使わず、そのディレクトリの origin でローカルと R2 の両方を選びます。`cwd` を省略した `list_sessions`、`search_sessions`、`read_session` は、クライアントのワークスペース、または root が無いときのプロセスの作業ディレクトリを使います。
 

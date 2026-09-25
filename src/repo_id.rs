@@ -65,11 +65,39 @@ fn finish(host: &str, port: Option<u16>, path: &str) -> Result<String> {
     }
 }
 
+/// Normalize a recorded working directory (e.g. from Antigravity file URIs or percent-encoded paths) into a filesystem path.
+pub fn normalize_cwd(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return PathBuf::new();
+    }
+    if trimmed.starts_with("file://") {
+        if let Ok(url) = Url::parse(trimmed) {
+            if let Ok(path) = url.to_file_path() {
+                return path;
+            }
+        }
+    } else if trimmed.starts_with('/') {
+        if let Ok(url) = Url::parse(&format!("file://{trimmed}")) {
+            if let Ok(path) = url.to_file_path() {
+                return path;
+            }
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
 /// Directory whose origin scopes a query. An omitted cwd is the process directory.
 pub fn scope_directory(cwd: Option<&Path>, process_cwd: &Path) -> PathBuf {
     match cwd {
-        Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(path) => process_cwd.join(path),
+        Some(path) => {
+            let normalized = normalize_cwd(&path.to_string_lossy());
+            if normalized.is_absolute() {
+                normalized
+            } else {
+                process_cwd.join(normalized)
+            }
+        }
         None => process_cwd.to_path_buf(),
     }
 }
@@ -155,11 +183,11 @@ pub fn session_repo(cwd: Option<&str>) -> Result<SessionRepo> {
     let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
         return Ok(SessionRepo::MissingCwd);
     };
-    let path = Path::new(cwd);
+    let path = normalize_cwd(cwd);
     if !path.is_dir() {
         return Ok(SessionRepo::MissingCwd);
     }
-    match origin_of(path) {
+    match origin_of(&path) {
         Ok(key) => Ok(SessionRepo::Key(key)),
         Err(OriginError::GitMissing) => Err(Error::msg("git is not installed")),
         Err(error) => Ok(SessionRepo::Unresolved(error.to_string())),
@@ -213,5 +241,29 @@ mod tests {
             scope_directory(Some(Path::new("crate")), process),
             PathBuf::from(r"D:\work\repo\crate")
         );
+    }
+
+    #[test]
+    fn normalize_cwd_handles_file_uris_and_plain_paths() {
+        assert_eq!(normalize_cwd(""), PathBuf::new());
+        assert_eq!(
+            normalize_cwd("/Users/user/project"),
+            PathBuf::from("/Users/user/project")
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                normalize_cwd("d:\\work\\repo"),
+                PathBuf::from(r"d:\work\repo")
+            );
+            assert_eq!(
+                normalize_cwd("file:///d:/work/repo"),
+                PathBuf::from(r"d:\work\repo")
+            );
+            assert_eq!(
+                normalize_cwd("/d:/work/repo"),
+                PathBuf::from(r"d:\work\repo")
+            );
+        }
     }
 }

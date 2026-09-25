@@ -80,6 +80,8 @@ struct ReadSessionRequest {
     id: String,
     /// Only look in this harness. Omit to look across every harness in the repository.
     from: Option<String>,
+    /// Directory whose git origin selects the repository. Omit to use the client workspace, or this process's working directory when the client reports no workspace.
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -256,7 +258,7 @@ impl ArchiveServer {
     }
 
     #[tool(
-        description = "Read one session from the merged local and R2 archive as token-optimized text. `id` is a session id, unambiguous prefix, or exact title. Append `#range` (1-based inclusive, for example `abc#5-12`) to read part of it. Reads over the byte budget are refused with suggested ranges. `from` limits the harness. The repository is the client workspace, or this process's working directory when the client reports no workspace.",
+        description = "Read one session from the merged local and R2 archive as token-optimized text. `id` is a session id, unambiguous prefix, or exact title. Append `#range` (1-based inclusive, for example `abc#5-12`) to read part of it. Reads over the byte budget are refused with suggested ranges. `from` limits the harness. `cwd` selects the repository by its git origin. Omit `cwd` to use the client workspace, or this process's working directory when the client reports no workspace.",
         annotations(title = "Read session", read_only_hint = true)
     )]
     async fn read_session(
@@ -266,7 +268,7 @@ impl ArchiveServer {
     ) -> Result<String, ErrorData> {
         let from = parse_from(request.from.as_deref())?;
         refuse_live(from)?;
-        let mut scope = self.open(None, from, &peer).await?;
+        let mut scope = self.open(request.cwd.as_deref(), from, &peer).await?;
         let (view, range) = {
             let (view, range) = find_session(&scope.merged, &request.id).map_err(tool_error)?;
             (view.clone(), range)
@@ -728,5 +730,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("not absolute"), "{error}");
+    }
+
+    #[test]
+    fn read_session_request_deserializes_with_optional_cwd() {
+        let json_with_cwd = r#"{"id":"test-123","cwd":"/path/to/repo"}"#;
+        let req: ReadSessionRequest = serde_json::from_str(json_with_cwd).unwrap();
+        assert_eq!(req.id, "test-123");
+        assert_eq!(req.cwd.as_deref(), Some("/path/to/repo"));
+        assert_eq!(req.from, None);
+
+        let json_without_cwd = r#"{"id":"test-456"}"#;
+        let req: ReadSessionRequest = serde_json::from_str(json_without_cwd).unwrap();
+        assert_eq!(req.id, "test-456");
+        assert_eq!(req.cwd, None);
     }
 }

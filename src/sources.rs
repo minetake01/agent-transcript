@@ -98,14 +98,35 @@ pub fn collect(stored_generations: &BTreeMap<String, String>) -> Result<Collecte
             &mut collected,
         )?;
     }
-    if let Some(store) = antigravity::AntigravityStore::default_root() {
-        open_paths(
-            HarnessId::Antigravity,
-            tree_generation(&store.root.join("conversations")),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
+    let ag_stores = antigravity_stores();
+    if !ag_stores.is_empty() {
+        let generation = ag_stores
+            .iter()
+            .map(|s| tree_generation(&s.root.join("conversations")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let key = HarnessId::Antigravity.as_str();
+        if stored_generations.get(key) == Some(&generation) {
+            collected.quiet.push(HarnessId::Antigravity);
+            collected.generations.insert(key.to_string(), generation);
+        } else {
+            for store in ag_stores {
+                let discovered = store.discover().map_err(tx_error)?;
+                let refs: Vec<PathBuf> =
+                    discovered.iter().map(|item| item.reference.clone()).collect();
+                let fingerprints = store.fingerprints(&refs).map_err(tx_error)?;
+                for item in &discovered {
+                    let source = item.reference.to_string_lossy().into_owned();
+                    let fingerprint = fingerprints.get(&source).cloned().unwrap_or_default();
+                    collected.candidates.push(Candidate {
+                        harness: HarnessId::Antigravity,
+                        source,
+                        fingerprint,
+                    });
+                }
+            }
+            collected.generations.insert(key.to_string(), generation);
+        }
     }
     if let Some(store) = grok::GrokStore::default_root() {
         open_paths(
@@ -281,7 +302,14 @@ fn read_transcript(candidate: &Candidate) -> std::result::Result<Transcript<Comm
         HarnessId::Cursor => load_path(cursor::CursorStore::default_root(), candidate),
         HarnessId::Amp => load_path(amp::AmpStore::default_root(), candidate),
         HarnessId::Antigravity => {
-            load_path(antigravity::AntigravityStore::default_root(), candidate)
+            let path = PathBuf::from(&candidate.source);
+            let root = path
+                .parent()
+                .and_then(|p| p.parent())
+                .map(PathBuf::from)
+                .or_else(|| antigravity::AntigravityStore::default_root().map(|s| s.root));
+            let store = root.map(antigravity::AntigravityStore::new);
+            load_path(store, candidate)
         }
         HarnessId::Grok => load_path(grok::GrokStore::default_root(), candidate),
         HarnessId::GrokBot => load_path(grok_bot::GrokBotStore::default_root(), candidate),
@@ -425,4 +453,23 @@ fn walk_rows(root: &Path, dir: &Path, rows: &mut Vec<String>) {
         let relative = path.strip_prefix(root).unwrap_or(&path);
         rows.push(format!("{}:{modified}:{}", relative.display(), meta.len()));
     }
+}
+
+pub fn antigravity_stores() -> Vec<antigravity::AntigravityStore> {
+    let mut stores = Vec::new();
+    if let Some(store) = antigravity::AntigravityStore::default_root() {
+        if store.root.join("conversations").is_dir() {
+            stores.push(store);
+        }
+    }
+    if let Some(home) = crate::config::user_home_dir() {
+        let ide_root = home.join(".gemini").join("antigravity");
+        if ide_root.join("conversations").is_dir() {
+            let ide_store = antigravity::AntigravityStore::new(&ide_root);
+            if !stores.iter().any(|s| s.root == ide_store.root) {
+                stores.push(ide_store);
+            }
+        }
+    }
+    stores
 }
