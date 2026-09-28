@@ -1,368 +1,146 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use chrono::{DateTime, Utc};
-use txcript::harness::antigravity;
-use txcript::local::Session;
-use txcript::{local, Codec, Common, HarnessId, Store, Transcript};
+use txcript::{Common, HarnessId, Transcript};
 
 use crate::catalog::Catalog;
 use crate::crypto::Key;
 use crate::document::ArchiveDocument;
 use crate::error::{Error, Result};
+use crate::local_state::{LocalStore, SourceRecord};
 use crate::merge::{
     choose_current, select, Current, Freshness, LocalView, MergedView, Pick, RemoteView,
 };
 use crate::remote::{document_from_plaintext, load_plaintext};
-use crate::repo_id::{scope_directory, RepoCache, SessionRepo};
+use crate::sources::{self, Candidate, LoadFailure};
 use crate::store::R2;
 
-enum LocalSource {
-    Txcript(Session),
-    Antigravity {
-        store: antigravity::AntigravityStore,
-        reference: PathBuf,
-    },
+/// Local session views grouped and deduplicated from the persistent records.
+///
+/// Bodies are only read here to break exact metadata ties between two
+/// records of the same session (mirrors the previous `fill()` behavior);
+/// everything else is answered from the stored record metadata.
+pub fn local_views(store: &LocalStore) -> Result<Vec<LocalView>> {
+    store
+        .grouped()
+        .into_values()
+        .map(|group| choose_local(group.into_iter().map(view_of).collect()))
+        .collect()
 }
 
-impl LocalSource {
-    fn read(&self) -> Result<Transcript<Common>> {
-        match self {
-            Self::Txcript(session) => session.read().map_err(|e| Error::msg(e.to_string())),
-            Self::Antigravity { store, reference } => {
-                let native = store.load(reference).map_err(|e| Error::msg(e.to_string()))?;
-                <antigravity::Antigravity as Codec>::to_common(&native)
-                    .map_err(|e| Error::msg(e.to_string()))
-            }
-        }
-    }
+/// Merge local views with the catalog's remote revisions for one repository.
+pub fn merged(
+    repo_key: &str,
+    from: Option<HarnessId>,
+    locals: &[LocalView],
+    catalog: &Catalog,
+) -> Result<Vec<MergedView>> {
+    let remotes = remote_views(catalog)?;
+    select(repo_key, from, locals, &remotes)
 }
 
-pub struct Scope {
-    pub repo_key: String,
-    pub catalog_etag: Option<String>,
-    pub merged: Vec<MergedView>,
-    sessions: HashMap<(HarnessId, String), LocalSource>,
-    loaded: HashMap<(HarnessId, String), Transcript<Common>>,
-    fingerprints: HashMap<(HarnessId, String), String>,
-}
-
-impl Scope {
-    pub fn prepare_search_fingerprints(&mut self) {
-        let keys: Vec<_> = self.sessions.keys().cloned().collect();
-        let mut txcript_keys = Vec::new();
-        let mut txcript_sessions = Vec::new();
-        let mut ag_keys_sources = Vec::new();
-
-        for key in keys {
-            if let Some(source) = self.sessions.remove(&key) {
-                match source {
-                    LocalSource::Txcript(session) => {
-                        txcript_keys.push(key);
-                        txcript_sessions.push(session);
-                    }
-                    LocalSource::Antigravity { store, reference } => {
-                        ag_keys_sources.push((key, store, reference));
-                    }
-                }
-            }
-        }
-
-        let values = local::fingerprints(&txcript_sessions);
-        for ((key, session), value) in txcript_keys.into_iter().zip(txcript_sessions).zip(values) {
-            if !value.is_empty() {
-                self.fingerprints.insert(key.clone(), value);
-            }
-            self.sessions.insert(key, LocalSource::Txcript(session));
-        }
-
-        for (key, store, reference) in ag_keys_sources {
-            if let Ok(mut map) = store.fingerprints(&[reference.clone()]) {
-                if let Some(fp) = map.remove(&reference.to_string_lossy().into_owned()) {
-                    if !fp.is_empty() {
-                        self.fingerprints.insert(key.clone(), fp);
-                    }
-                }
-            }
-            self.sessions
-                .insert(key, LocalSource::Antigravity { store, reference });
-        }
-    }
-
-    pub fn fingerprint(&self, view: &MergedView) -> Option<String> {
-        match view.pick {
-            Pick::Remote => Some(view.content_hash.clone()),
-            Pick::Local => self
-                .fingerprints
-                .get(&(view.harness, view.session_id.clone()))
-                .cloned(),
-            Pick::Ambiguous => None,
-        }
-    }
-
-    pub async fn transcript(
-        &mut self,
-        r2: &R2,
-        key: &Key,
-        cache_dir: &Path,
-        view: &MergedView,
-    ) -> Result<Transcript<Common>> {
-        let map_key = (view.harness, view.session_id.clone());
-        if view.pick == Pick::Ambiguous {
-            return Err(Error::Ambiguous {
-                harness: view.harness.to_string(),
-                session_id: view.session_id.clone(),
-            });
-        }
-        if let Some(transcript) = self.loaded.get(&map_key) {
-            return Ok(transcript.clone());
-        }
-        let transcript = match view.pick {
-            Pick::Local => {
-                let session = self.sessions.get(&map_key).ok_or_else(|| {
-                    Error::msg(format!(
-                        "local session {} {} disappeared",
-                        view.harness, view.session_id
-                    ))
-                })?;
-                session.read().map_err(|error| {
-                    Error::msg(format!(
-                        "reading {} {}: {error}",
-                        view.harness, view.session_id
-                    ))
-                })?
-            }
-            Pick::Remote => {
-                let object_key = view.object_key.as_deref().ok_or_else(|| {
-                    Error::msg(format!(
-                        "remote session {} {} has no object",
-                        view.harness, view.session_id
-                    ))
-                })?;
-                let plain =
-                    load_plaintext(r2, key, cache_dir, object_key, &view.content_hash).await?;
-                document_from_plaintext(&plain)?.into_transcript()?
-            }
-            Pick::Ambiguous => unreachable!("ambiguous sessions return before this match"),
-        };
-        self.loaded.insert(map_key, transcript.clone());
-        Ok(transcript)
-    }
-}
-
-pub async fn open_scope(
+/// Read the body a merged view points at.
+///
+/// `Local` reads the source on disk right now — local sessions are always
+/// fresh. `Remote` reads the encrypted object through the plaintext cache.
+pub async fn transcript(
     r2: &R2,
     key: &Key,
-    cwd: Option<&str>,
-    from: Option<HarnessId>,
-) -> Result<Scope> {
-    let process = std::env::current_dir()?;
-    let dir = scope_directory(cwd.map(Path::new), &process);
-    if !dir.is_dir() {
-        return Err(Error::msg(format!("{} is not a directory", dir.display())));
-    }
-    let repo_key =
-        crate::repo_id::origin_of(&dir).map_err(|error| Error::msg(error.to_string()))?;
-    let (catalog, catalog_etag) = crate::remote::load_catalog(r2, key).await?;
-    let repo_for_thread = repo_key.clone();
-    let catalog_for_thread = catalog.clone();
-    let catalog_etag_for_thread = catalog_etag.clone();
-    tokio::task::spawn_blocking(move || {
-        prepare(
-            repo_for_thread,
-            from,
-            catalog_for_thread,
-            catalog_etag_for_thread,
-        )
-    })
-    .await
-    .map_err(|error| Error::msg(format!("scanning local sessions: {error}")))?
-}
-
-fn prepare(
-    repo_key: String,
-    from: Option<HarnessId>,
-    catalog: Catalog,
-    catalog_etag: Option<String>,
-) -> Result<Scope> {
-    let remotes = remote_views(&catalog)?;
-    let mut held = discover_held()?;
-    held = dedupe_locals(held)?;
-    let mut loaded = HashMap::new();
-    for item in &mut held {
-        let Some(local_repo) = item.view.repo_key.clone() else {
-            continue;
-        };
-        let Some(remote) = remotes.iter().find(|remote| {
-            remote.repo_key == local_repo
-                && remote.harness == item.view.harness
-                && remote.session_id == item.view.session_id
-        }) else {
-            continue;
-        };
-        if needs_local_body(&item.view.freshness, &remote.freshness) {
-            fill(item, &mut loaded)?;
-        }
-    }
-    let locals: Vec<LocalView> = held.iter().map(|item| item.view.clone()).collect();
-    let merged = select(&repo_key, from, &locals, &remotes)?;
-    let selected: HashSet<_> = merged
-        .iter()
-        .filter(|view| view.pick == Pick::Local)
-        .map(|view| (view.harness, view.session_id.clone()))
-        .collect();
-    let mut sessions = HashMap::new();
-    for item in held {
-        let identity = (item.view.harness, item.view.session_id);
-        if selected.contains(&identity) {
-            sessions.insert(identity, item.session);
-        }
-    }
-    Ok(Scope {
-        repo_key,
-        catalog_etag,
-        merged,
-        sessions,
-        loaded,
-        fingerprints: HashMap::new(),
-    })
-}
-
-struct Held {
-    session: LocalSource,
-    view: LocalView,
-}
-
-fn discover_held() -> Result<Vec<Held>> {
-    let mut repos = RepoCache::default();
-    let mut held = Vec::new();
-    for session in local::discover() {
-        if matches!(session.harness, HarnessId::ClaudeChat | HarnessId::ChatGpt) {
-            continue;
-        }
-        let repo = repos.resolve(session.meta.cwd.as_deref())?;
-        let repo_key = match repo {
-            SessionRepo::Key(key) => Some(key),
-            SessionRepo::MissingCwd | SessionRepo::Unresolved(_) => None,
-        };
-        let view = LocalView {
-            harness: session.harness,
-            session_id: session.meta.id.clone(),
-            repo_key,
-            freshness: Freshness {
-                updated_at: session.updated_at,
-                last_message_at: None,
-                message_count: 0,
-                content_hash: String::new(),
-            },
-            started_at: session.meta.timestamp,
-            title: session.meta.title.clone(),
-            cwd: session.meta.cwd.clone(),
-            git_branch: session.meta.git_branch.clone(),
-            model: session.meta.model.clone(),
-        };
-        held.push(Held {
-            session: LocalSource::Txcript(session),
-            view,
-        });
-    }
-
-    // Also discover Antigravity IDE sessions that local::discover() skips
-    for store in crate::sources::antigravity_stores() {
-        if let Some(default) = antigravity::AntigravityStore::default_root() {
-            if store.root == default.root {
-                continue;
-            }
-        }
-        for d in store.discover().unwrap_or_default() {
-            let repo = repos.resolve(d.meta.cwd.as_deref())?;
-            let repo_key = match repo {
-                SessionRepo::Key(key) => Some(key),
-                SessionRepo::MissingCwd | SessionRepo::Unresolved(_) => None,
+    cache_dir: &Path,
+    view: &MergedView,
+) -> Result<Transcript<Common>> {
+    match view.pick {
+        Pick::Ambiguous => Err(Error::Ambiguous {
+            harness: view.harness.to_string(),
+            session_id: view.session_id.clone(),
+        }),
+        Pick::Local => {
+            let source = view.local_source.clone().ok_or_else(|| {
+                Error::msg(format!(
+                    "local session {} {} has no source",
+                    view.harness, view.session_id
+                ))
+            })?;
+            let candidate = Candidate {
+                harness: view.harness,
+                source,
+                fingerprint: view.local_fingerprint.clone().unwrap_or_default(),
             };
-            let updated_at = std::fs::metadata(&d.reference)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(DateTime::<Utc>::from);
-            let view = LocalView {
-                harness: HarnessId::Antigravity,
-                session_id: d.meta.id.clone(),
-                repo_key,
-                freshness: Freshness {
-                    updated_at,
-                    last_message_at: None,
-                    message_count: 0,
-                    content_hash: String::new(),
-                },
-                started_at: d.meta.timestamp,
-                title: d.meta.title.clone(),
-                cwd: d.meta.cwd.clone(),
-                git_branch: d.meta.git_branch.clone(),
-                model: d.meta.model.clone(),
-            };
-            held.push(Held {
-                session: LocalSource::Antigravity {
-                    store: store.clone(),
-                    reference: d.reference,
-                },
-                view,
-            });
+            sources::load(&candidate)
+                .map(|loaded| loaded.transcript)
+                .map_err(|failure| load_error(view, failure))
+        }
+        Pick::Remote => {
+            let object_key = view.object_key.as_deref().ok_or_else(|| {
+                Error::msg(format!(
+                    "remote session {} {} has no object",
+                    view.harness, view.session_id
+                ))
+            })?;
+            let plain = load_plaintext(r2, key, cache_dir, object_key, &view.content_hash).await?;
+            document_from_plaintext(&plain)?.into_transcript()
         }
     }
-
-    Ok(held)
 }
 
-fn dedupe_locals(held: Vec<Held>) -> Result<Vec<Held>> {
-    let mut groups: Vec<Vec<Held>> = Vec::new();
-    for item in held {
-        if let Some(group) = groups.iter_mut().find(|group| {
-            group[0].view.harness == item.view.harness
-                && group[0].view.session_id == item.view.session_id
-                && group[0].view.repo_key == item.view.repo_key
-        }) {
-            group.push(item);
-        } else {
-            groups.push(vec![item]);
-        }
+/// Stat fingerprint used as the search-cache key for a merged document.
+/// Remote documents key on their content hash; local documents on the
+/// source fingerprint recorded by the local state store.
+pub fn fingerprint_of(view: &MergedView) -> String {
+    match view.pick {
+        Pick::Remote => view.content_hash.clone(),
+        Pick::Local => view.local_fingerprint.clone().unwrap_or_default(),
+        Pick::Ambiguous => String::new(),
     }
-    groups.into_iter().map(choose_local).collect()
 }
 
-fn choose_local(mut group: Vec<Held>) -> Result<Held> {
-    if group.len() == 1 || group[0].view.repo_key.is_none() {
+fn view_of(record: &SourceRecord) -> LocalView {
+    LocalView {
+        harness: record.harness,
+        session_id: record.session_id.clone(),
+        repo_key: record.repo_key.clone(),
+        source: record.source.clone(),
+        fingerprint: record.fingerprint.clone(),
+        freshness: Freshness {
+            updated_at: record.updated_at,
+            last_message_at: record.last_message_at,
+            message_count: record.message_count,
+            content_hash: record.content_hash.clone(),
+        },
+        started_at: record.started_at,
+        title: record.title.clone(),
+        cwd: record.cwd.clone(),
+        git_branch: record.git_branch.clone(),
+        model: record.model.clone(),
+    }
+}
+
+fn choose_local(mut group: Vec<LocalView>) -> Result<LocalView> {
+    if group.len() == 1 || group[0].repo_key.is_none() {
         return Ok(group
             .into_iter()
-            .max_by_key(|item| item.view.freshness.updated_at)
+            .max_by_key(|view| view.freshness.updated_at)
             .expect("group is non-empty"));
     }
-    let dated = group
-        .iter()
-        .all(|item| item.view.freshness.updated_at.is_some());
-    let first = group[0].view.freshness.updated_at;
-    if dated
-        && group
-            .iter()
-            .any(|item| item.view.freshness.updated_at != first)
-    {
+    let dated = group.iter().all(|view| view.freshness.updated_at.is_some());
+    let first = group[0].freshness.updated_at;
+    if dated && group.iter().any(|view| view.freshness.updated_at != first) {
         return Ok(group
             .into_iter()
-            .max_by_key(|item| item.view.freshness.updated_at)
+            .max_by_key(|view| view.freshness.updated_at)
             .expect("group is non-empty"));
     }
-    let mut loaded = HashMap::new();
-    for item in &mut group {
-        fill(item, &mut loaded)?;
+    for view in &mut group {
+        fill(view)?;
     }
     let mut best = group.remove(0);
     for other in group {
-        match crate::merge::prefer(&best.view.freshness, &other.view.freshness) {
+        match crate::merge::prefer(&best.freshness, &other.freshness) {
             Ok(crate::merge::Side::Local) => {}
             Ok(crate::merge::Side::Remote) => best = other,
             Err(_) => {
                 return Err(Error::Ambiguous {
-                    harness: best.view.harness.to_string(),
-                    session_id: best.view.session_id,
+                    harness: best.harness.to_string(),
+                    session_id: best.session_id,
                 })
             }
         }
@@ -370,42 +148,50 @@ fn choose_local(mut group: Vec<Held>) -> Result<Held> {
     Ok(best)
 }
 
-fn needs_local_body(local: &Freshness, remote: &Freshness) -> bool {
-    !matches!(
-        (local.updated_at, remote.updated_at),
-        (Some(left), Some(right)) if left != right
-    )
-}
-
-fn fill(
-    item: &mut Held,
-    loaded: &mut HashMap<(HarnessId, String), Transcript<Common>>,
-) -> Result<()> {
-    let repo_key = item
-        .view
+/// Tie resolution: read the body once to rank two equally dated records of
+/// the same session.
+fn fill(view: &mut LocalView) -> Result<()> {
+    let repo_key = view
         .repo_key
         .clone()
         .ok_or_else(|| Error::msg("cannot hash a session with no repo key"))?;
-    let transcript = item.session.read().map_err(|error| {
-        Error::msg(format!(
-            "reading {} {}: {error}",
-            item.view.harness, item.view.session_id
-        ))
-    })?;
-    let document = ArchiveDocument::new(item.view.harness, repo_key, transcript.clone());
-    item.view.freshness.last_message_at = document.messages.last().map(|message| message.timestamp);
-    item.view.freshness.message_count = document.messages.len() as u64;
-    item.view.freshness.content_hash = document.content_hash()?;
-    item.view.title = document.meta.title.clone();
-    item.view.cwd = document.meta.cwd.clone();
-    item.view.git_branch = document.meta.git_branch.clone();
-    item.view.model = document.meta.model.clone();
-    item.view.started_at = document.meta.timestamp;
-    loaded.insert(
-        (item.view.harness, item.view.session_id.clone()),
-        transcript,
-    );
+    let candidate = Candidate {
+        harness: view.harness,
+        source: view.source.clone(),
+        fingerprint: view.fingerprint.clone(),
+    };
+    let transcript = sources::load(&candidate)
+        .map(|loaded| loaded.transcript)
+        .map_err(|failure| {
+            Error::msg(format!(
+                "reading {} {}: {}",
+                view.harness,
+                view.session_id,
+                match failure {
+                    LoadFailure::Transient(message) | LoadFailure::Broken(message) => message,
+                }
+            ))
+        })?;
+    let document = ArchiveDocument::new(view.harness, repo_key, transcript);
+    view.freshness.last_message_at = document.messages.last().map(|message| message.timestamp);
+    view.freshness.message_count = document.messages.len() as u64;
+    view.freshness.content_hash = document.content_hash()?;
+    view.title = document.meta.title.clone();
+    view.cwd = document.meta.cwd.clone();
+    view.git_branch = document.meta.git_branch.clone();
+    view.model = document.meta.model.clone();
+    view.started_at = document.meta.timestamp;
     Ok(())
+}
+
+fn load_error(view: &MergedView, failure: LoadFailure) -> Error {
+    let message = match failure {
+        LoadFailure::Transient(message) | LoadFailure::Broken(message) => message,
+    };
+    Error::msg(format!(
+        "reading {} {}: {message}",
+        view.harness, view.session_id
+    ))
 }
 
 fn remote_views(catalog: &Catalog) -> Result<Vec<RemoteView>> {

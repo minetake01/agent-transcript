@@ -177,6 +177,8 @@ mod tests {
             sort_at: timestamp,
             object_key: None,
             content_hash: "hash".into(),
+            local_source: None,
+            local_fingerprint: None,
         };
         let key = DocKey {
             harness: view.harness,

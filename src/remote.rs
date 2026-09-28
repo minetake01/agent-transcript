@@ -25,7 +25,8 @@ pub async fn commit_catalog(r2: &R2, key: &Key, incoming: &Catalog) -> Result<()
     }
     for attempt in 1..=5 {
         let (base, etag) = load_catalog(r2, key).await?;
-        let merged = merge_catalogs(&base, incoming)?;
+        let mut merged = merge_catalogs(&base, incoming)?;
+        crate::catalog::prune_to_current(&mut merged);
         let plain = serde_json::to_vec(&merged)?;
         let blob = crypto::encrypt(key, CATALOG_KEY, &plain)?;
         let precondition = match &etag {

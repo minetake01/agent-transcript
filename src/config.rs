@@ -8,6 +8,10 @@ use crate::error::{Error, Result};
 
 pub const SCHEMA: u32 = 1;
 
+/// Bucket usage above this triggers a warning during ingest sweeps. Nothing
+/// is deleted for size alone — sessions are never dropped to fit.
+const DEFAULT_MAX_BUCKET_BYTES: u64 = 1 << 30;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -23,9 +27,18 @@ pub struct Config {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub mode: Mode,
+    /// Soft ceiling for total bucket bytes (default 1 GiB). Exceeding it
+    /// warns; nothing is deleted for size alone.
+    #[serde(default)]
+    pub max_bucket_bytes: Option<u64>,
 }
 
 impl Config {
+    /// The configured bucket ceiling — warnings only, never deletion.
+    pub fn bucket_cap(&self) -> u64 {
+        self.max_bucket_bytes.unwrap_or(DEFAULT_MAX_BUCKET_BYTES)
+    }
+
     pub fn endpoint(&self) -> String {
         format!(
             "https://{}.r2.cloudflarestorage.com",
@@ -151,6 +164,7 @@ pub fn init(options: InitOptions) -> Result<(PathBuf, bool)> {
         access_key_id: options.access_key_id,
         secret_access_key: options.secret_access_key,
         mode: options.mode,
+        max_bucket_bytes: None,
     };
     fs::write(
         config_path()?,

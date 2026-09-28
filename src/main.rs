@@ -258,6 +258,7 @@ async fn run() -> agent_transcript::Result<()> {
             let cache_dir = config::cache_dir()?;
             let r2 = agent_transcript::store::R2::new(&config);
             let can_write = config.mode == config::Mode::Readwrite;
+            let mut local = agent_transcript::local_state::LocalStore::load(&cache_dir);
             let snapshot = if can_write {
                 agent_transcript::search_index::build_for_cwd(
                     &r2,
@@ -265,6 +266,7 @@ async fn run() -> agent_transcript::Result<()> {
                     &cache_dir,
                     cwd.as_deref(),
                     true,
+                    &mut local,
                 )
                 .await?
             } else {
@@ -284,6 +286,7 @@ async fn run() -> agent_transcript::Result<()> {
                             &cache_dir,
                             cwd.as_deref(),
                             false,
+                            &mut local,
                         )
                         .await?
                     }

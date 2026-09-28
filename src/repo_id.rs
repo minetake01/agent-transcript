@@ -239,7 +239,7 @@ mod tests {
         assert_eq!(scope_directory(None, process), process);
         assert_eq!(
             scope_directory(Some(Path::new("crate")), process),
-            PathBuf::from(r"D:\work\repo\crate")
+            process.join("crate")
         );
     }
 

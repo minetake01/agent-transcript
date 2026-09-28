@@ -7,6 +7,7 @@ pub mod error;
 pub mod fragment;
 pub mod ingest;
 pub mod install;
+pub mod local_state;
 pub mod mcp;
 pub mod merge;
 pub mod read;

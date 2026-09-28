@@ -46,7 +46,12 @@ impl ArchiveDocument {
         Ok(Transcript::new(self.meta, self.messages))
     }
 
-    pub fn revision(&self, hash: &str, updated_at: Option<DateTime<Utc>>) -> Result<Revision> {
+    pub fn revision(
+        &self,
+        hash: &str,
+        updated_at: Option<DateTime<Utc>>,
+        size: u64,
+    ) -> Result<Revision> {
         Ok(Revision {
             content_hash: hash.to_string(),
             object_key: object_key(hash)?,
@@ -58,6 +63,7 @@ impl ArchiveDocument {
             git_branch: self.meta.git_branch.clone(),
             model: self.meta.model.clone(),
             message_count: self.messages.len() as u64,
+            size,
         })
     }
 }

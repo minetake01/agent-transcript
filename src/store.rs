@@ -4,9 +4,17 @@ use aws_sdk_s3::config::{
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use chrono::{DateTime, Utc};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+
+/// One object from a bucket listing.
+pub struct Listed {
+    pub key: String,
+    pub size: u64,
+    pub last_modified: Option<DateTime<Utc>>,
+}
 
 pub struct Fetched {
     pub body: Vec<u8>,
@@ -93,8 +101,40 @@ impl R2 {
         }
     }
 
+    /// The object's current ETag without downloading it. `None` when the key
+    /// does not exist.
+    pub async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => Ok(output.e_tag().map(str::to_string)),
+            Err(error)
+                if error
+                    .raw_response()
+                    .is_some_and(|raw| raw.status().as_u16() == 404) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(Error::msg(format!("heading `{key}`: {error}"))),
+        }
+    }
+
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
+        Ok(self
+            .list_detailed(prefix)
+            .await?
+            .into_iter()
+            .map(|object| object.key)
+            .collect())
+    }
+
+    pub async fn list_detailed(&self, prefix: &str) -> Result<Vec<Listed>> {
+        let mut objects = Vec::new();
         let mut token = None;
         loop {
             let mut request = self
@@ -111,7 +151,13 @@ impl R2 {
                 .map_err(|error| Error::msg(format!("listing `{prefix}`: {error}")))?;
             for object in page.contents() {
                 if let Some(key) = object.key() {
-                    keys.push(key.to_string());
+                    objects.push(Listed {
+                        key: key.to_string(),
+                        size: object.size().unwrap_or_default() as u64,
+                        last_modified: object
+                            .last_modified()
+                            .and_then(|time| DateTime::from_timestamp(time.secs(), 0)),
+                    });
                 }
             }
             if page.is_truncated() == Some(true) {
@@ -125,7 +171,7 @@ impl R2 {
                 break;
             }
         }
-        Ok(keys)
+        Ok(objects)
     }
 
     pub async fn delete(&self, key: &str) -> Result<()> {

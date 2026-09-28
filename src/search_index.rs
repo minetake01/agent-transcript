@@ -6,6 +6,7 @@
 //! query. A snapshot contains the complete searchable set for one repository
 //! and can therefore be used directly by the query path.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,10 +17,11 @@ use txcript::search::{DocKey, Extracted, Index};
 
 use crate::crypto::{self, Key};
 use crate::error::{Error, Result};
-use crate::merge::Pick;
+use crate::local_state::LocalStore;
+use crate::merge::{MergedView, Pick};
 use crate::repo_id;
 use crate::search_cache;
-use crate::sessions::{self, Scope};
+use crate::sessions;
 use crate::store::{Precondition, R2};
 
 /// Version of the on-disk/R2 snapshot format.
@@ -55,35 +57,40 @@ struct Document {
 /// An in-memory index built from a snapshot.
 ///
 /// The index is kept behind an `Arc` by the MCP server so repeated searches do
-/// not deserialize or rebuild it.
+/// not deserialize or rebuild it. `documents` mirrors `index` with the
+/// serializable form of each doc so an updated runtime can be persisted back
+/// into a snapshot (`Extracted` is consumed by `insert_extracted`).
 pub struct Runtime {
     pub index: Index,
     repo_key: String,
-    generation: String,
+    catalog_etag: Option<String>,
     generated_at: DateTime<Utc>,
-    documents: usize,
+    documents: HashMap<DocKey, DocEntry>,
+    dirty: bool,
+}
+
+struct DocEntry {
+    fingerprint: String,
+    extracted: serde_json::Value,
 }
 
 impl Snapshot {
-    /// Build a snapshot from a fully merged scope.
+    /// Build a snapshot from merged views.
     ///
     /// This is intentionally the slow path: it may read local transcripts and
     /// fetch remote objects. Once it completes, all subsequent searches can use
     /// the resulting snapshot without doing that work again.
-    pub async fn from_scope(
-        mut scope: Scope,
+    pub async fn from_merged(
+        repo_key: &str,
+        catalog_etag: Option<String>,
+        merged: &[MergedView],
         r2: &R2,
         encryption_key: &Key,
         cache_dir: &Path,
     ) -> Result<Self> {
-        scope.prepare_search_fingerprints();
-        let repo_key = scope.repo_key.clone();
         let mut documents = Vec::new();
 
-        // `Scope::transcript` needs mutable access while it fills its internal
-        // transcript cache. Clone the small view list rather than borrowing the
-        // scope for the whole asynchronous loop.
-        for view in scope.merged.clone() {
+        for view in merged {
             if view.pick == Pick::Ambiguous {
                 continue;
             }
@@ -92,24 +99,23 @@ impl Snapshot {
                 id: view.session_id.clone(),
                 source: None,
             };
-            let fingerprint = scope.fingerprint(&view).unwrap_or_default();
+            let fingerprint = sessions::fingerprint_of(view);
             let extracted = if fingerprint.is_empty() {
                 None
             } else {
-                search_cache::get(cache_dir, &repo_key, &view, &fingerprint, &doc_key)
+                search_cache::get(cache_dir, repo_key, view, &fingerprint, &doc_key)
             };
             let extracted = match extracted {
                 Some(extracted) => extracted,
                 None => {
-                    let transcript = scope
-                        .transcript(r2, encryption_key, cache_dir, &view)
-                        .await?;
+                    let transcript =
+                        sessions::transcript(r2, encryption_key, cache_dir, view).await?;
                     let extracted = Extracted::new(doc_key.clone(), &transcript);
                     if !fingerprint.is_empty() {
                         search_cache::put(
                             cache_dir,
-                            &repo_key,
-                            &view,
+                            repo_key,
+                            view,
                             &fingerprint,
                             doc_key.clone(),
                             &extracted,
@@ -137,9 +143,9 @@ impl Snapshot {
         let snapshot = Self {
             schema: SCHEMA,
             format: FORMAT.to_string(),
-            repo_key,
+            repo_key: repo_key.to_string(),
             generation,
-            catalog_etag: scope.catalog_etag.clone(),
+            catalog_etag,
             generated_at: Utc::now(),
             documents,
         };
@@ -156,22 +162,32 @@ impl Snapshot {
     pub fn into_runtime(self) -> Runtime {
         let Snapshot {
             repo_key,
-            generation,
+            catalog_etag,
             generated_at,
             documents,
             ..
         } = self;
-        let count = documents.len();
         let mut index = Index::new();
+        let mut map = HashMap::with_capacity(documents.len());
         for document in documents {
+            let extracted =
+                serde_json::to_value(&document.extracted).unwrap_or(serde_json::Value::Null);
+            map.insert(
+                document.key.clone(),
+                DocEntry {
+                    fingerprint: document.fingerprint,
+                    extracted,
+                },
+            );
             index.insert_extracted(document.extracted);
         }
         Runtime {
             index,
             repo_key,
-            generation,
+            catalog_etag,
             generated_at,
-            documents: count,
+            documents: map,
+            dirty: false,
         }
     }
 
@@ -229,12 +245,21 @@ impl Snapshot {
 }
 
 impl Runtime {
-    pub fn repo_key(&self) -> &str {
-        &self.repo_key
+    /// An empty runtime for a repository with no snapshot anywhere yet —
+    /// the first sync fills it incrementally.
+    pub fn empty(repo_key: &str) -> Self {
+        Self {
+            index: Index::new(),
+            repo_key: repo_key.to_string(),
+            catalog_etag: None,
+            generated_at: Utc::now(),
+            documents: HashMap::new(),
+            dirty: false,
+        }
     }
 
-    pub fn generation(&self) -> &str {
-        &self.generation
+    pub fn repo_key(&self) -> &str {
+        &self.repo_key
     }
 
     pub fn generated_at(&self) -> DateTime<Utc> {
@@ -242,7 +267,81 @@ impl Runtime {
     }
 
     pub fn documents(&self) -> usize {
+        self.documents.len()
+    }
+
+    pub fn fingerprint(&self, key: &DocKey) -> Option<&str> {
         self.documents
+            .get(key)
+            .map(|entry| entry.fingerprint.as_str())
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &DocKey> {
+        self.documents.keys()
+    }
+
+    pub fn upsert(&mut self, key: DocKey, fingerprint: String, extracted: Extracted) {
+        let value = serde_json::to_value(&extracted).unwrap_or(serde_json::Value::Null);
+        self.index.insert_extracted(extracted);
+        self.documents.insert(
+            key,
+            DocEntry {
+                fingerprint,
+                extracted: value,
+            },
+        );
+        self.dirty = true;
+        self.generated_at = Utc::now();
+    }
+
+    pub fn remove(&mut self, key: &DocKey) {
+        self.index.remove(key);
+        if self.documents.remove(key).is_some() {
+            self.dirty = true;
+            self.generated_at = Utc::now();
+        }
+    }
+
+    /// Rebuild a snapshot from the current documents so an incrementally
+    /// updated runtime can be persisted again.
+    pub fn to_snapshot(&self) -> Result<Snapshot> {
+        let mut documents = Vec::with_capacity(self.documents.len());
+        for (key, entry) in &self.documents {
+            documents.push(Document {
+                key: key.clone(),
+                fingerprint: entry.fingerprint.clone(),
+                extracted: serde_json::from_value(entry.extracted.clone())?,
+            });
+        }
+        documents.sort_by(|left, right| {
+            left.key
+                .harness
+                .as_str()
+                .cmp(right.key.harness.as_str())
+                .then_with(|| left.key.id.cmp(&right.key.id))
+                .then_with(|| left.key.source.cmp(&right.key.source))
+        });
+        let generation = generation(&documents)?;
+        Ok(Snapshot {
+            schema: SCHEMA,
+            format: FORMAT.to_string(),
+            repo_key: self.repo_key.clone(),
+            generation,
+            catalog_etag: self.catalog_etag.clone(),
+            generated_at: self.generated_at,
+            documents,
+        })
+    }
+
+    /// Persist when the runtime changed since the last save. Returns whether
+    /// a snapshot was actually written.
+    pub fn persist(&mut self, cache_dir: &Path) -> Result<bool> {
+        if !self.dirty {
+            return Ok(false);
+        }
+        save_local(cache_dir, &self.to_snapshot()?)?;
+        self.dirty = false;
+        Ok(true)
     }
 }
 
@@ -325,12 +424,15 @@ pub async fn build_for_directory(
     cache_dir: &Path,
     directory: &Path,
     publish: bool,
+    local: &mut LocalStore,
 ) -> Result<Snapshot> {
-    let directory = directory
-        .to_str()
-        .ok_or_else(|| Error::msg(format!("directory is not Unicode: {}", directory.display())))?;
-    let scope = sessions::open_scope(r2, key, Some(directory), None).await?;
-    let snapshot = Snapshot::from_scope(scope, r2, key, cache_dir).await?;
+    let repo_key = repo_id::origin_of(directory).map_err(|error| Error::msg(error.to_string()))?;
+    let (catalog, catalog_etag) = crate::remote::load_catalog(r2, key).await?;
+    local.diff()?;
+    let locals = sessions::local_views(local)?;
+    let merged = sessions::merged(&repo_key, None, &locals, &catalog)?;
+    let snapshot =
+        Snapshot::from_merged(&repo_key, catalog_etag, &merged, r2, key, cache_dir).await?;
     if publish {
         publish_remote(r2, key, &snapshot).await?;
     }
@@ -346,9 +448,10 @@ pub async fn build_for_cwd(
     cache_dir: &Path,
     cwd: Option<&str>,
     publish: bool,
+    local: &mut LocalStore,
 ) -> Result<Snapshot> {
     let directory = requested_directory(cwd)?;
-    build_for_directory(r2, key, cache_dir, &directory, publish).await
+    build_for_directory(r2, key, cache_dir, &directory, publish, local).await
 }
 
 /// Download an already published index without scanning local stores.
@@ -503,6 +606,35 @@ mod tests {
     fn remote_key_is_stable_and_repo_specific() {
         assert_eq!(remote_key("repo"), remote_key("repo"));
         assert_ne!(remote_key("repo"), remote_key("other"));
+    }
+
+    #[test]
+    fn runtime_upserts_removes_and_persists_incrementally() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = "https://example.test/repo";
+        let mut runtime = Runtime::empty(repo);
+        // Nothing changed — no file is written.
+        assert!(!runtime.persist(dir.path()).unwrap());
+        assert!(!local_path(dir.path(), repo).exists());
+
+        let (key, extracted) = extracted(HarnessId::Codex, "s1", "needle");
+        runtime.upsert(key.clone(), "fp1".into(), extracted);
+        assert_eq!(runtime.fingerprint(&key), Some("fp1"));
+        assert!(runtime.persist(dir.path()).unwrap());
+        // A second persist with no changes writes nothing.
+        assert!(!runtime.persist(dir.path()).unwrap());
+
+        let loaded = load_local(dir.path(), repo).unwrap().unwrap();
+        assert_eq!(loaded.documents(), 1);
+        let mut runtime = loaded.into_runtime();
+        assert_eq!(runtime.fingerprint(&key), Some("fp1"));
+        runtime.remove(&key);
+        assert_eq!(runtime.keys().count(), 0);
+        assert!(runtime.persist(dir.path()).unwrap());
+        assert_eq!(
+            load_local(dir.path(), repo).unwrap().unwrap().documents(),
+            0
+        );
     }
 
     #[test]

@@ -112,8 +112,10 @@ pub fn collect(stored_generations: &BTreeMap<String, String>) -> Result<Collecte
         } else {
             for store in ag_stores {
                 let discovered = store.discover().map_err(tx_error)?;
-                let refs: Vec<PathBuf> =
-                    discovered.iter().map(|item| item.reference.clone()).collect();
+                let refs: Vec<PathBuf> = discovered
+                    .iter()
+                    .map(|item| item.reference.clone())
+                    .collect();
                 let fingerprints = store.fingerprints(&refs).map_err(tx_error)?;
                 for item in &discovered {
                     let source = item.reference.to_string_lossy().into_owned();
@@ -274,23 +276,64 @@ where
         collected.generations.insert(key.to_string(), generation);
         return Ok(());
     }
+    collected
+        .candidates
+        .extend(enumerate(harness, store, source_of)?);
+    collected.generations.insert(key.to_string(), generation);
+    Ok(())
+}
+
+fn enumerate<S, R>(
+    harness: HarnessId,
+    store: S,
+    source_of: impl Fn(&R) -> String,
+) -> Result<Vec<Candidate>>
+where
+    S: Store<Ref = R>,
+    R: Clone,
+{
     let discovered = store.discover().map_err(tx_error)?;
     let refs: Vec<R> = discovered
         .iter()
         .map(|item| item.reference.clone())
         .collect();
     let fingerprints = store.fingerprints(&refs).map_err(tx_error)?;
+    let mut candidates = Vec::with_capacity(discovered.len());
     for item in &discovered {
         let source = source_of(&item.reference);
         let fingerprint = fingerprints.get(&source).cloned().unwrap_or_default();
-        collected.candidates.push(Candidate {
+        candidates.push(Candidate {
             harness,
             source,
             fingerprint,
         });
     }
-    collected.generations.insert(key.to_string(), generation);
-    Ok(())
+    Ok(candidates)
+}
+
+/// Enumerate sessions of a database-backed store. Used by the local state
+/// diff, which calls this only when the database fingerprint changed.
+pub fn discover_db_candidates(harness: HarnessId) -> Result<Vec<Candidate>> {
+    match harness {
+        HarnessId::Hermes => {
+            let store = hermes::HermesStore::default_root()
+                .ok_or_else(|| Error::msg("hermes store is unavailable"))?;
+            enumerate(harness, store, Clone::clone)
+        }
+        HarnessId::CursorDesktop => {
+            let store = cursor_desktop::CursorDesktopStore::default_root()
+                .ok_or_else(|| Error::msg("cursor desktop store is unavailable"))?;
+            enumerate(harness, store, Clone::clone)
+        }
+        HarnessId::OpenCode => {
+            let store = opencode::OpenCodeStore::default_db()
+                .ok_or_else(|| Error::msg("opencode store is unavailable"))?;
+            enumerate(harness, store, Clone::clone)
+        }
+        _ => Err(Error::msg(format!(
+            "{harness} is not a database-backed store"
+        ))),
+    }
 }
 
 fn read_transcript(candidate: &Candidate) -> std::result::Result<Transcript<Common>, LoadFailure> {
@@ -383,7 +426,7 @@ fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(modified))
 }
 
-fn db_fingerprint(path: &Path) -> String {
+pub(crate) fn db_fingerprint(path: &Path) -> String {
     [path, &sidecar(path, "-wal"), &sidecar(path, "-shm")]
         .into_iter()
         .map(file_fingerprint)
@@ -391,7 +434,7 @@ fn db_fingerprint(path: &Path) -> String {
         .join("|")
 }
 
-fn file_fingerprint(path: &Path) -> String {
+pub(crate) fn file_fingerprint(path: &Path) -> String {
     match fs::metadata(path) {
         Err(_) => String::new(),
         Ok(meta) => {
@@ -415,21 +458,42 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn tree_generation(root: &Path) -> String {
-    if !root.exists() {
-        return "missing".into();
-    }
-    let mut rows = Vec::new();
-    walk_rows(root, root, &mut rows);
-    rows.sort();
-    let mut hasher = Sha256::new();
-    for row in &rows {
-        hasher.update(row.as_bytes());
-        hasher.update([b'\n']);
-    }
-    hex::encode(hasher.finalize())
+    hex::encode(tree_rows_hash(walk_tree(root).iter()))
 }
 
-fn walk_rows(root: &Path, dir: &Path, rows: &mut Vec<String>) {
+/// One file under a store root, relative to the root.
+pub(crate) struct TreeRow {
+    pub rel: String,
+    pub mtime_ns: u128,
+    pub size: u64,
+}
+
+/// Stat-only recursive listing of a store root.
+pub(crate) fn walk_tree(root: &Path) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    if root.exists() {
+        walk_rows(root, root, &mut rows);
+    }
+    rows.sort_by(|left, right| left.rel.cmp(&right.rel));
+    rows
+}
+
+fn tree_rows_hash<'a>(rows: impl Iterator<Item = &'a TreeRow>) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    for row in rows {
+        hasher.update(format!("{}:{}:{}", row.rel, row.mtime_ns, row.size).as_bytes());
+        hasher.update([b'\n']);
+    }
+    hasher.finalize().to_vec()
+}
+
+/// Fingerprint every file under `dir` — for session sources that are a
+/// directory (grok/fx/grok_bot session folders) rather than a single file.
+pub(crate) fn dir_fingerprint<'a>(rows: impl Iterator<Item = &'a TreeRow>) -> String {
+    hex::encode(tree_rows_hash(rows))
+}
+
+fn walk_rows(root: &Path, dir: &Path, rows: &mut Vec<TreeRow>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -451,7 +515,11 @@ fn walk_rows(root: &Path, dir: &Path, rows: &mut Vec<String>) {
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_nanos());
         let relative = path.strip_prefix(root).unwrap_or(&path);
-        rows.push(format!("{}:{modified}:{}", relative.display(), meta.len()));
+        rows.push(TreeRow {
+            rel: relative.to_string_lossy().into_owned(),
+            mtime_ns: modified,
+            size: meta.len(),
+        });
     }
 }
 

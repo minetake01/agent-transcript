@@ -1,6 +1,6 @@
 [package]
 name = "agent-transcript"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Read-only archive of coding-agent transcripts on Cloudflare R2."
 license = "Apache-2.0"
@@ -31,3 +31,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "pro
 toml = "0.8"
 txcript = { version = "0.14.4", default-features = false, features = ["search", "opencode", "hermes"] }
 url = "2"
+zstd = "0.13"

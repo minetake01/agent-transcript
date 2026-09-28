@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Catalog, SessionRecord, SCHEMA};
@@ -21,6 +22,12 @@ use txcript::HarnessId;
 
 const CURSOR_SCHEMA: u32 = 2;
 const WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How often ingest runs the orphan sweep and bucket-size report.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Objects younger than this are never deleted during a sweep — a
+/// concurrent ingest on another machine may have already PUT the object but
+/// not committed its catalog reference yet.
+const SWEEP_GRACE: Duration = Duration::from_secs(600);
 
 struct Upload {
     object_key: String,
@@ -47,6 +54,10 @@ struct CursorSet {
     schema: u32,
     sessions: BTreeMap<String, StoredCursor>,
     stores: BTreeMap<String, String>,
+    /// Last orphan sweep. Sweeps are rate-limited so most ingests skip the
+    /// bucket listing entirely.
+    #[serde(default)]
+    last_sweep: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,6 +103,19 @@ pub async fn ingest() -> Result<()> {
     commit_catalog(&r2, &index_key, &scan.incoming).await?;
     save_cursors(&cursors_path, &scan.cursors)?;
 
+    if sweep_due(scan.cursors.last_sweep) {
+        match sweep(&r2, &index_key, &config).await {
+            Ok(()) => {
+                let mut cursors = scan.cursors.clone();
+                cursors.last_sweep = Some(Utc::now());
+                if let Err(error) = save_cursors(&cursors_path, &cursors) {
+                    eprintln!("agent-transcript: saving sweep cursor: {error}");
+                }
+            }
+            Err(error) => eprintln!("agent-transcript: bucket sweep failed: {error}"),
+        }
+    }
+
     // Rebuild changed repositories and initialize any repository that has no
     // durable search snapshot yet. This is deliberately outside the MCP
     // request path; the next search reads the resulting snapshot directly.
@@ -104,12 +128,18 @@ pub async fn ingest() -> Result<()> {
             index_dirs.insert(repo_key.clone(), directory.clone());
         }
     }
+    let mut local = crate::local_state::LocalStore::load(&cache_dir);
     for directory in index_dirs.values() {
-        if let Err(error) =
-            search_index::build_for_directory(&r2, &index_key, &cache_dir, directory, true).await
+        if let Err(error) = search_index::build_for_directory(
+            &r2, &index_key, &cache_dir, directory, true, &mut local,
+        )
+        .await
         {
             eprintln!("agent-transcript: search index refresh failed: {error}");
         }
+    }
+    if let Err(error) = local.save_if_dirty() {
+        eprintln!("agent-transcript: saving local state: {error}");
     }
     println!(
         "uploaded {} session(s), unchanged {}, read {}, missing cwd {}",
@@ -140,33 +170,96 @@ pub async fn gc() -> Result<()> {
     config.require_write()?;
     let key = config::load_key()?;
     let r2 = R2::new(&config);
-    let (catalog, _) = load_catalog(&r2, &key).await?;
-    let mut live = HashSet::new();
-    for session in &catalog.sessions {
-        for revision in &session.revisions {
-            live.insert(revision.object_key.clone());
-        }
+    sweep(&r2, &key, &config).await
+}
+
+fn sweep_due(last: Option<DateTime<Utc>>) -> bool {
+    match last {
+        Some(last) => Utc::now()
+            .signed_duration_since(last)
+            .to_std()
+            .map(|elapsed| elapsed >= SWEEP_INTERVAL)
+            .unwrap_or(true),
+        None => true,
     }
-    let mut deleted = 0usize;
-    for key in r2.list("v1/objects/").await? {
-        if !live.contains(&key) {
-            r2.delete(&key).await?;
-            deleted += 1;
-        }
-    }
+}
+
+/// Delete objects no longer referenced by the catalog and report the bucket
+/// footprint. Nothing is deleted for size alone; sessions are never dropped
+/// to fit under `max_bucket_bytes`.
+async fn sweep(r2: &R2, key: &Key, config: &config::Config) -> Result<()> {
+    let (catalog, _) = load_catalog(r2, key).await?;
+    let live = catalog
+        .sessions
+        .iter()
+        .flat_map(|session| session.revisions.iter())
+        .map(|revision| revision.object_key.clone())
+        .collect::<HashSet<_>>();
     let live_indexes = catalog
         .sessions
         .iter()
         .map(|session| search_index::remote_key(&session.repo_key))
         .collect::<HashSet<_>>();
-    for key in r2.list("v1/search/").await? {
-        if !live_indexes.contains(&key) {
-            r2.delete(&key).await?;
+    let cutoff = Utc::now()
+        - chrono::Duration::from_std(SWEEP_GRACE).unwrap_or_else(|_| chrono::Duration::minutes(10));
+    let objects = r2.list_detailed("v1/").await?;
+    let mut total = 0u64;
+    let mut deleted = 0usize;
+    for object in &objects {
+        let orphan = is_orphan(&object.key, &live, &live_indexes);
+        if orphan
+            && object
+                .last_modified
+                .is_some_and(|modified| modified < cutoff)
+        {
+            r2.delete(&object.key).await?;
             deleted += 1;
+            continue;
         }
+        total += object.size;
     }
-    println!("deleted {deleted} unreferenced object(s)");
+    println!(
+        "bucket {} across {} object(s){}",
+        fmt_bytes(total),
+        objects.len() - deleted,
+        if deleted > 0 {
+            format!(", deleted {deleted} unreferenced")
+        } else {
+            String::new()
+        }
+    );
+    let cap = config.bucket_cap();
+    if total > cap {
+        eprintln!(
+            "agent-transcript: warning — bucket holds {}, above the {} \
+             max_bucket_bytes target. Revisions are pruned automatically on \
+             commit; reduce churn or raise max_bucket_bytes in config.toml.",
+            fmt_bytes(total),
+            fmt_bytes(cap)
+        );
+    }
     Ok(())
+}
+
+/// Whether a bucket object is no longer referenced by the catalog. The
+/// catalog object itself is never an orphan.
+fn is_orphan(key: &str, live: &HashSet<String>, live_indexes: &HashSet<String>) -> bool {
+    match key.strip_prefix("v1/") {
+        Some(rest) if rest.starts_with("objects/") => !live.contains(key),
+        Some(rest) if rest.starts_with("search/") => !live_indexes.contains(key),
+        _ => false,
+    }
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn scan(mut cursors: CursorSet, catalog: Catalog, key: Key) -> Result<Scan> {
@@ -423,9 +516,9 @@ fn push_loaded(
                 scan.unchanged += 1;
                 return Ok(());
             }
-            let revision = document.revision(&hash, updated_at)?;
-            let object_key = revision.object_key.clone();
+            let object_key = crate::catalog::object_key(&hash)?;
             let blob = encrypt_document(key, &object_key, &document)?;
+            let revision = document.revision(&hash, updated_at, blob.len() as u64)?;
             let piece = Catalog {
                 schema: SCHEMA,
                 sessions: vec![SessionRecord {
@@ -587,6 +680,7 @@ impl CursorSet {
             schema: CURSOR_SCHEMA,
             sessions: BTreeMap::new(),
             stores: BTreeMap::new(),
+            last_sweep: None,
         }
     }
 }
@@ -748,5 +842,20 @@ mod tests {
             source_key(HarnessId::Codex, r"C:\sessions\s1"),
             "codex\nC:\\sessions\\s1"
         );
+    }
+
+    #[test]
+    fn orphan_detection_keeps_live_objects_and_index_snapshots() {
+        let live: HashSet<String> = ["v1/objects/sha256/aa/rest".to_string()]
+            .into_iter()
+            .collect();
+        let indexes: HashSet<String> = ["v1/search/deadbeef".to_string()].into_iter().collect();
+        assert!(!is_orphan("v1/objects/sha256/aa/rest", &live, &indexes));
+        assert!(is_orphan("v1/objects/sha256/bb/rest", &live, &indexes));
+        assert!(!is_orphan("v1/search/deadbeef", &live, &indexes));
+        assert!(is_orphan("v1/search/ffff", &live, &indexes));
+        // The catalog and anything outside v1/ is never an orphan.
+        assert!(!is_orphan("v1/catalog", &live, &indexes));
+        assert!(!is_orphan("v2/objects/x", &live, &indexes));
     }
 }

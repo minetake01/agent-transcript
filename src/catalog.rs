@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use txcript::HarnessId;
 
 use crate::error::{Error, Result};
+use crate::merge::{choose_current, prefer, Current, Freshness, Side};
 
 pub const CATALOG_KEY: &str = "v1/catalog";
 pub const SCHEMA: u32 = 1;
@@ -33,6 +36,10 @@ pub struct Revision {
     pub git_branch: Option<String>,
     pub model: Option<String>,
     pub message_count: u64,
+    /// Compressed ciphertext bytes stored under `object_key`. Zero for
+    /// revisions written before the field existed.
+    #[serde(default)]
+    pub size: u64,
 }
 
 impl Catalog {
@@ -125,6 +132,68 @@ pub fn object_key(content_hash: &str) -> Result<String> {
     ))
 }
 
+/// Drop revisions strictly superseded by the current one.
+///
+/// The winning revision and every revision tied with it at the top rank stay
+/// — the ties are what remote ambiguity detection compares — while anything
+/// clearly older is removed so `gc` can reclaim its object. Readers only ever
+/// serve the current revision, so nothing user-visible is lost. Revisions
+/// sharing a content hash collapse to one entry (same object anyway).
+pub fn prune_to_current(catalog: &mut Catalog) {
+    for session in &mut catalog.sessions {
+        if session.revisions.len() <= 1 {
+            continue;
+        }
+        let ranked = session
+            .revisions
+            .iter()
+            .map(|revision| Freshness {
+                updated_at: revision.updated_at,
+                last_message_at: revision.last_message_at,
+                message_count: revision.message_count,
+                content_hash: revision.content_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        let best = match choose_current(&ranked) {
+            Ok(Current::Index(index)) | Ok(Current::Ambiguous { display: index }) => index,
+            Err(_) => continue,
+        };
+        let mut by_hash: HashMap<&str, usize> = HashMap::new();
+        for (index, revision) in session.revisions.iter().enumerate() {
+            if matches!(prefer(&ranked[index], &ranked[best]), Ok(Side::Remote)) {
+                continue;
+            }
+            match by_hash.get(revision.content_hash.as_str()) {
+                None => {
+                    by_hash.insert(revision.content_hash.as_str(), index);
+                }
+                // Prefer the winner's own metadata among same-body duplicates.
+                Some(_) if index == best => {
+                    by_hash.insert(revision.content_hash.as_str(), index);
+                }
+                Some(_) => {}
+            }
+        }
+        let mut keep: Vec<usize> = by_hash.values().copied().collect();
+        keep.sort_unstable();
+        session.revisions = keep
+            .iter()
+            .map(|&index| session.revisions[index].clone())
+            .collect();
+    }
+}
+
+/// Total ciphertext bytes referenced by the catalog. Revisions written before
+/// `size` existed count as zero, so this is a lower bound.
+pub fn referenced_bytes(catalog: &Catalog) -> u64 {
+    catalog
+        .sessions
+        .iter()
+        .flat_map(|session| session.revisions.iter())
+        .map(|revision| revision.size)
+        .sum()
+}
+
 pub fn validate(catalog: &Catalog) -> Result<()> {
     if catalog.schema != SCHEMA {
         return Err(Error::Schema {
@@ -171,6 +240,7 @@ mod tests {
             git_branch: None,
             model: None,
             message_count: messages,
+            size: 0,
         }
     }
 
@@ -235,5 +305,45 @@ mod tests {
         catalog.schema = 2;
         let error = merge_catalogs(&catalog, &Catalog::empty()).unwrap_err();
         assert!(matches!(error, Error::Schema { schema: 2 }));
+    }
+
+    #[test]
+    fn prune_drops_superseded_but_keeps_ties() {
+        let mut catalog = Catalog {
+            schema: SCHEMA,
+            sessions: vec![session(
+                "s1",
+                vec![
+                    revision("aa11", 10, Some(1)),
+                    revision("bb22", 3, Some(9)),
+                    revision("cc33", 3, Some(9)),
+                    revision("bb22", 3, Some(9)),
+                ],
+            )],
+        };
+        prune_to_current(&mut catalog);
+        let hashes: Vec<&str> = catalog.sessions[0]
+            .revisions
+            .iter()
+            .map(|r| r.content_hash.as_str())
+            .collect();
+        // aa11 is strictly older; bb22 and cc33 tie at the newest rank
+        // (same time and count, different bodies) and the duplicate bb22
+        // entry collapses.
+        assert_eq!(hashes, ["bb22", "cc33"]);
+    }
+
+    #[test]
+    fn prune_keeps_single_current_revision() {
+        let mut catalog = Catalog {
+            schema: SCHEMA,
+            sessions: vec![session(
+                "s1",
+                vec![revision("aa11", 10, Some(1)), revision("bb22", 3, Some(9))],
+            )],
+        };
+        prune_to_current(&mut catalog);
+        assert_eq!(catalog.sessions[0].revisions.len(), 1);
+        assert_eq!(catalog.sessions[0].revisions[0].content_hash, "bb22");
     }
 }

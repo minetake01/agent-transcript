@@ -22,6 +22,12 @@ pub struct LocalView {
     pub harness: HarnessId,
     pub session_id: String,
     pub repo_key: Option<String>,
+    /// Where `sources::load` reads the body. Kept on the view so the read
+    /// path never needs the discovery record again.
+    pub source: String,
+    /// Stat fingerprint of the source. Compared per request by the local
+    /// state store; also the search-cache key for local documents.
+    pub fingerprint: String,
     pub freshness: Freshness,
     pub started_at: DateTime<Utc>,
     pub title: Option<String>,
@@ -67,6 +73,10 @@ pub struct MergedView {
     pub sort_at: DateTime<Utc>,
     pub object_key: Option<String>,
     pub content_hash: String,
+    /// Local source path when a local twin exists — set for `Local` picks and
+    /// for `Remote`/`Ambiguous` picks that still have a local copy.
+    pub local_source: Option<String>,
+    pub local_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +216,7 @@ fn merge_pair(local: &LocalView, remote: &RemoteView) -> Result<MergedView> {
     }
     match prefer(&local.freshness, &remote.freshness) {
         Ok(Side::Local) => Ok(from_local(local)),
-        Ok(Side::Remote) => Ok(from_remote(remote)),
+        Ok(Side::Remote) => Ok(from_remote_with_local(remote, local)),
         Err(_) => Ok(ambiguous_local(local)),
     }
 }
@@ -224,6 +234,8 @@ fn ambiguous_local(local: &LocalView) -> MergedView {
         sort_at: sort_time(&local.freshness, local.started_at),
         object_key: None,
         content_hash: String::new(),
+        local_source: Some(local.source.clone()),
+        local_fingerprint: Some(local.fingerprint.clone()),
     }
 }
 
@@ -240,6 +252,8 @@ fn from_local(local: &LocalView) -> MergedView {
         sort_at: sort_time(&local.freshness, local.started_at),
         object_key: None,
         content_hash: local.freshness.content_hash.clone(),
+        local_source: Some(local.source.clone()),
+        local_fingerprint: Some(local.fingerprint.clone()),
     }
 }
 
@@ -268,7 +282,17 @@ fn from_remote(remote: &RemoteView) -> MergedView {
         } else {
             remote.freshness.content_hash.clone()
         },
+        local_source: None,
+        local_fingerprint: None,
     }
+}
+
+/// Remote pick that still knows its local twin.
+fn from_remote_with_local(remote: &RemoteView, local: &LocalView) -> MergedView {
+    let mut view = from_remote(remote);
+    view.local_source = Some(local.source.clone());
+    view.local_fingerprint = Some(local.fingerprint.clone());
+    view
 }
 
 fn sort_time(freshness: &Freshness, started_at: DateTime<Utc>) -> DateTime<Utc> {
@@ -300,6 +324,8 @@ mod tests {
             harness: HarnessId::ClaudeCode,
             session_id: id.into(),
             repo_key: repo.map(str::to_string),
+            source: format!("src-{id}"),
+            fingerprint: format!("fp-{id}"),
             freshness,
             started_at: at(1),
             title: Some(format!("title-{id}")),
