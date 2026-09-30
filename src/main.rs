@@ -305,7 +305,7 @@ async fn run() -> agent_transcript::Result<()> {
             Ok(())
         }
         Command::Update => {
-            println!("{}", agent_transcript::update::update().await?);
+            println!("{}", agent_transcript::update::update()?);
             Ok(())
         }
     }

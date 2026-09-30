@@ -11,14 +11,12 @@ name = "agent-transcript"
 path = "src/main.rs"
 
 [dependencies]
-async-trait = "0.1"
-aws-sdk-s3 = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+hmac = "0.12"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rmcp = { version = "3", default-features = false, features = ["macros", "server", "transport-io"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
@@ -30,5 +28,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "process", "time"] }
 toml = "0.8"
 txcript = { version = "0.14.4", default-features = false, features = ["search", "opencode", "hermes"] }
+ureq = { version = "3", features = ["json"] }
 url = "2"
+xmlparser = "0.13"
 zstd = "0.13"

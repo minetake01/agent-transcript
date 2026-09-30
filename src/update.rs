@@ -79,48 +79,41 @@ fn verify(binary: &[u8], checksum: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn download(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>> {
-    let mut response = client
+fn download(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>> {
+    let mut response = agent
         .get(url)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
+        .call()
         .map_err(|e| Error::msg(format!("download failed: {e}")))?;
     if response
-        .content_length()
-        .is_some_and(|len| len > limit as u64)
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|len| len > limit)
     {
         return Err(Error::msg("release asset is too large"));
     }
-    let mut data = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| Error::msg(e.to_string()))?
-    {
-        if chunk.len() > limit.saturating_sub(data.len()) {
-            return Err(Error::msg("release asset is too large"));
-        }
-        data.extend_from_slice(&chunk);
-    }
-    Ok(data)
+    response
+        .body_mut()
+        .with_config()
+        .limit(limit)
+        .read_to_vec()
+        .map_err(|e| Error::msg(format!("release asset is too large: {e}")))
 }
 
-pub async fn update() -> Result<String> {
-    let client = reqwest::Client::builder()
+pub fn update() -> Result<String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
         .user_agent(concat!("agent-transcript/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(60))
+        .timeout_global(Some(Duration::from_secs(60)))
         .build()
-        .map_err(|e| Error::msg(e.to_string()))?;
+        .into();
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let release: Release = client
+    let release: Release = agent
         .get(url)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
+        .call()
         .map_err(|e| Error::msg(format!("cannot check GitHub Releases: {e}")))?
-        .json()
-        .await
+        .body_mut()
+        .read_json()
         .map_err(|e| Error::msg(format!("invalid release response: {e}")))?;
     let Some(version) = newer_version(&release.tag_name, env!("CARGO_PKG_VERSION"))? else {
         return Ok(format!(
@@ -133,13 +126,12 @@ pub async fn update() -> Result<String> {
         return Err(Error::msg("release tag must be a stable v<version>"));
     }
     let name = asset_name()?;
-    let binary = download(&client, asset_url(&release, name)?, MAX_BINARY).await?;
+    let binary = download(&agent, asset_url(&release, name)?, MAX_BINARY as u64)?;
     let checksum = download(
-        &client,
+        &agent,
         asset_url(&release, &format!("{name}.sha256"))?,
         1024,
-    )
-    .await?;
+    )?;
     verify(
         &binary,
         &String::from_utf8(checksum).map_err(|e| Error::msg(e.to_string()))?,
