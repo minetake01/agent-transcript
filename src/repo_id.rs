@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use url::Url;
@@ -158,25 +157,6 @@ pub enum SessionRepo {
     Key(String),
     MissingCwd,
     Unresolved(String),
-}
-
-#[derive(Debug, Default)]
-pub struct RepoCache {
-    by_cwd: HashMap<String, SessionRepo>,
-}
-
-impl RepoCache {
-    pub fn resolve(&mut self, cwd: Option<&str>) -> Result<SessionRepo> {
-        let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
-            return Ok(SessionRepo::MissingCwd);
-        };
-        if let Some(resolved) = self.by_cwd.get(cwd) {
-            return Ok(resolved.clone());
-        }
-        let resolved = session_repo(Some(cwd))?;
-        self.by_cwd.insert(cwd.to_string(), resolved.clone());
-        Ok(resolved)
-    }
 }
 
 pub fn session_repo(cwd: Option<&str>) -> Result<SessionRepo> {

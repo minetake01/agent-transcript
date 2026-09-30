@@ -53,16 +53,20 @@ impl ArchiveDocument {
         size: u64,
     ) -> Result<Revision> {
         Ok(Revision {
-            content_hash: hash.to_string(),
             object_key: object_key(hash)?,
-            title: self.meta.title.clone(),
-            started_at: self.meta.timestamp,
-            updated_at,
-            last_message_at: self.messages.last().map(|message| message.timestamp),
-            cwd: self.meta.cwd.clone(),
-            git_branch: self.meta.git_branch.clone(),
-            model: self.meta.model.clone(),
-            message_count: self.messages.len() as u64,
+            freshness: crate::merge::Freshness {
+                updated_at,
+                last_message_at: self.messages.last().map(|message| message.timestamp),
+                message_count: self.messages.len() as u64,
+                content_hash: hash.to_string(),
+            },
+            info: crate::merge::Info {
+                started_at: self.meta.timestamp,
+                title: self.meta.title.clone(),
+                cwd: self.meta.cwd.clone(),
+                git_branch: self.meta.git_branch.clone(),
+                model: self.meta.model.clone(),
+            },
             size,
         })
     }
@@ -70,17 +74,6 @@ impl ArchiveDocument {
 
 pub fn encrypt_document(key: &Key, object: &str, document: &ArchiveDocument) -> Result<Vec<u8>> {
     crate::crypto::encrypt(key, object, &document.canonical_bytes()?)
-}
-
-pub fn decrypt_document(key: &Key, object: &str, blob: &[u8]) -> Result<ArchiveDocument> {
-    let plain = crate::crypto::decrypt(key, object, blob)?;
-    let document: ArchiveDocument = serde_json::from_slice(&plain)?;
-    if document.schema != SCHEMA {
-        return Err(crate::error::Error::Schema {
-            schema: document.schema,
-        });
-    }
-    Ok(document)
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {

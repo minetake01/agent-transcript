@@ -1,20 +1,37 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use txcript::HarnessId;
 
 use crate::error::{Error, Result};
 
+/// Which copy of a session supplies the body, or neither when the rank ties
+/// on different bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
+pub enum Preference {
     Local,
     Remote,
+    Ambiguous,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What makes one snapshot newer than another. Persisted inline in the
+/// catalog's revisions and the local source records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Freshness {
     pub updated_at: Option<DateTime<Utc>>,
     pub last_message_at: Option<DateTime<Utc>>,
     pub message_count: u64,
     pub content_hash: String,
+}
+
+/// Session presentation metadata shared by catalog revisions, local source
+/// records, and the merge views. Persisted inline where serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Info {
+    pub started_at: DateTime<Utc>,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,11 +46,7 @@ pub struct LocalView {
     /// state store; also the search-cache key for local documents.
     pub fingerprint: String,
     pub freshness: Freshness,
-    pub started_at: DateTime<Utc>,
-    pub title: Option<String>,
-    pub cwd: Option<String>,
-    pub git_branch: Option<String>,
-    pub model: Option<String>,
+    pub info: Info,
 }
 
 #[derive(Debug, Clone)]
@@ -43,11 +56,7 @@ pub struct RemoteView {
     pub repo_key: String,
     pub freshness: Freshness,
     pub object_key: String,
-    pub started_at: DateTime<Utc>,
-    pub title: Option<String>,
-    pub cwd: Option<String>,
-    pub git_branch: Option<String>,
-    pub model: Option<String>,
+    pub info: Info,
     /// Catalog revisions at the current rank disagree. A strictly newer local
     /// snapshot still wins; otherwise the session has no single body.
     pub ambiguous: bool,
@@ -65,11 +74,7 @@ pub struct MergedView {
     pub harness: HarnessId,
     pub session_id: String,
     pub pick: Pick,
-    pub started_at: DateTime<Utc>,
-    pub title: Option<String>,
-    pub cwd: Option<String>,
-    pub git_branch: Option<String>,
-    pub model: Option<String>,
+    pub info: Info,
     pub sort_at: DateTime<Utc>,
     pub object_key: Option<String>,
     pub content_hash: String,
@@ -114,14 +119,11 @@ pub fn choose_current(items: &[Freshness]) -> Result<Current> {
     })
 }
 
-pub fn prefer(left: &Freshness, right: &Freshness) -> Result<Side> {
+pub fn prefer(left: &Freshness, right: &Freshness) -> Preference {
     match rank(left, right) {
-        Rank::Left | Rank::Same => Ok(Side::Local),
-        Rank::Right => Ok(Side::Remote),
-        Rank::Ambiguous => Err(Error::Ambiguous {
-            harness: String::new(),
-            session_id: String::new(),
-        }),
+        Rank::Left | Rank::Same => Preference::Local,
+        Rank::Right => Preference::Remote,
+        Rank::Ambiguous => Preference::Ambiguous,
     }
 }
 
@@ -215,9 +217,9 @@ fn merge_pair(local: &LocalView, remote: &RemoteView) -> Result<MergedView> {
         return Ok(ambiguous_local(local));
     }
     match prefer(&local.freshness, &remote.freshness) {
-        Ok(Side::Local) => Ok(from_local(local)),
-        Ok(Side::Remote) => Ok(from_remote_with_local(remote, local)),
-        Err(_) => Ok(ambiguous_local(local)),
+        Preference::Local => Ok(from_local(local)),
+        Preference::Remote => Ok(from_remote_with_local(remote, local)),
+        Preference::Ambiguous => Ok(ambiguous_local(local)),
     }
 }
 
@@ -226,12 +228,8 @@ fn ambiguous_local(local: &LocalView) -> MergedView {
         harness: local.harness,
         session_id: local.session_id.clone(),
         pick: Pick::Ambiguous,
-        started_at: local.started_at,
-        title: local.title.clone(),
-        cwd: local.cwd.clone(),
-        git_branch: local.git_branch.clone(),
-        model: local.model.clone(),
-        sort_at: sort_time(&local.freshness, local.started_at),
+        info: local.info.clone(),
+        sort_at: sort_time(&local.freshness, local.info.started_at),
         object_key: None,
         content_hash: String::new(),
         local_source: Some(local.source.clone()),
@@ -244,12 +242,8 @@ fn from_local(local: &LocalView) -> MergedView {
         harness: local.harness,
         session_id: local.session_id.clone(),
         pick: Pick::Local,
-        started_at: local.started_at,
-        title: local.title.clone(),
-        cwd: local.cwd.clone(),
-        git_branch: local.git_branch.clone(),
-        model: local.model.clone(),
-        sort_at: sort_time(&local.freshness, local.started_at),
+        info: local.info.clone(),
+        sort_at: sort_time(&local.freshness, local.info.started_at),
         object_key: None,
         content_hash: local.freshness.content_hash.clone(),
         local_source: Some(local.source.clone()),
@@ -266,12 +260,8 @@ fn from_remote(remote: &RemoteView) -> MergedView {
         } else {
             Pick::Remote
         },
-        started_at: remote.started_at,
-        title: remote.title.clone(),
-        cwd: remote.cwd.clone(),
-        git_branch: remote.git_branch.clone(),
-        model: remote.model.clone(),
-        sort_at: sort_time(&remote.freshness, remote.started_at),
+        info: remote.info.clone(),
+        sort_at: sort_time(&remote.freshness, remote.info.started_at),
         object_key: if remote.ambiguous {
             None
         } else {
@@ -327,11 +317,13 @@ mod tests {
             source: format!("src-{id}"),
             fingerprint: format!("fp-{id}"),
             freshness,
-            started_at: at(1),
-            title: Some(format!("title-{id}")),
-            cwd: Some(r"C:\other\path".into()),
-            git_branch: None,
-            model: None,
+            info: Info {
+                started_at: at(1),
+                title: Some(format!("title-{id}")),
+                cwd: Some(r"C:\other\path".into()),
+                git_branch: None,
+                model: None,
+            },
         }
     }
 
@@ -342,11 +334,13 @@ mod tests {
             repo_key: repo.into(),
             freshness,
             object_key: format!("obj-{id}"),
-            started_at: at(1),
-            title: Some(format!("remote-{id}")),
-            cwd: Some("/home/other/repo".into()),
-            git_branch: None,
-            model: None,
+            info: Info {
+                started_at: at(1),
+                title: Some(format!("remote-{id}")),
+                cwd: Some("/home/other/repo".into()),
+                git_branch: None,
+                model: None,
+            },
             ambiguous: false,
         }
     }
@@ -356,9 +350,8 @@ mod tests {
         let chosen = prefer(
             &fresh(Some(10), None, 1, "local"),
             &fresh(Some(4), None, 99, "remote"),
-        )
-        .unwrap();
-        assert_eq!(chosen, Side::Local);
+        );
+        assert_eq!(chosen, Preference::Local);
     }
 
     #[test]
@@ -366,26 +359,23 @@ mod tests {
         let by_message = prefer(
             &fresh(None, Some(2), 5, "local"),
             &fresh(None, Some(8), 1, "remote"),
-        )
-        .unwrap();
-        assert_eq!(by_message, Side::Remote);
+        );
+        assert_eq!(by_message, Preference::Remote);
 
         let by_count = prefer(
             &fresh(Some(3), Some(3), 9, "local"),
             &fresh(Some(3), Some(1), 2, "remote"),
-        )
-        .unwrap();
-        assert_eq!(by_count, Side::Local);
+        );
+        assert_eq!(by_count, Preference::Local);
     }
 
     #[test]
     fn identical_times_and_counts_with_different_hashes_are_ambiguous() {
-        let error = prefer(
+        let choice = prefer(
             &fresh(Some(3), Some(3), 4, "local"),
             &fresh(Some(3), Some(3), 4, "remote"),
-        )
-        .unwrap_err();
-        assert!(matches!(error, Error::Ambiguous { .. }));
+        );
+        assert_eq!(choice, Preference::Ambiguous);
     }
 
     #[test]

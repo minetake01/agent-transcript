@@ -1,4 +1,13 @@
-use std::collections::BTreeMap;
+//! The harness registry: which stores exist on this machine, what identifies
+//! a session source inside each, and how a source's transcript loads.
+//!
+//! `sites()` is the single table of local archive locations. The persistent
+//! source state (`local_state`) walks every site's rows and applies its
+//! `Kind` rules to enumerate sources; `load` turns a source back into a
+//! transcript. Ingest and the MCP request path both read the records that
+//! diff produces, so this table is the only place that knows where
+//! transcripts live.
+
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -22,12 +31,6 @@ pub struct Candidate {
     pub fingerprint: String,
 }
 
-pub struct Collected {
-    pub candidates: Vec<Candidate>,
-    pub quiet: Vec<HarnessId>,
-    pub generations: BTreeMap<String, String>,
-}
-
 pub struct Loaded {
     pub transcript: Transcript<Common>,
     pub updated_at: Option<DateTime<Utc>>,
@@ -38,179 +41,243 @@ pub enum LoadFailure {
     Broken(String),
 }
 
-pub fn collect(stored_generations: &BTreeMap<String, String>) -> Result<Collected> {
-    let mut collected = Collected {
-        candidates: Vec::new(),
-        quiet: Vec::new(),
-        generations: BTreeMap::new(),
-    };
-    if let Some(store) = claude_code::ClaudeStore::default_root() {
-        open_paths(
-            HarnessId::ClaudeCode,
-            tree_generation(&store.root),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
-    }
-    if let Some(store) = codex::CodexStore::default_root() {
-        open_paths(
-            HarnessId::Codex,
-            tree_generation(&store.sessions_dir),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
-    }
-    if let Some(store) = pi::PiStore::default_root() {
-        open_paths(
-            HarnessId::Pi,
-            tree_generation(&store.sessions_dir),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
-    }
-    if let Some(store) = campfire::CampfireStore::default_root() {
-        open_paths(
-            HarnessId::Campfire,
-            tree_generation(&store.sessions_dir),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
-    }
-    if let Some(store) = cursor::CursorStore::default_root() {
-        open_paths(
-            HarnessId::Cursor,
-            tree_generation(&store.chats_dir),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
-    }
-    if let Some(store) = amp::AmpStore::default_root() {
-        open_paths(
-            HarnessId::Amp,
-            tree_generation(&store.threads_dir),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
-    }
-    let ag_stores = antigravity_stores();
-    if !ag_stores.is_empty() {
-        let generation = ag_stores
-            .iter()
-            .map(|s| tree_generation(&s.root.join("conversations")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let key = HarnessId::Antigravity.as_str();
-        if stored_generations.get(key) == Some(&generation) {
-            collected.quiet.push(HarnessId::Antigravity);
-            collected.generations.insert(key.to_string(), generation);
-        } else {
-            for store in ag_stores {
-                let discovered = store.discover().map_err(tx_error)?;
-                let refs: Vec<PathBuf> = discovered
-                    .iter()
-                    .map(|item| item.reference.clone())
-                    .collect();
-                let fingerprints = store.fingerprints(&refs).map_err(tx_error)?;
-                for item in &discovered {
-                    let source = item.reference.to_string_lossy().into_owned();
-                    let fingerprint = fingerprints.get(&source).cloned().unwrap_or_default();
-                    collected.candidates.push(Candidate {
-                        harness: HarnessId::Antigravity,
-                        source,
-                        fingerprint,
-                    });
-                }
-            }
-            collected.generations.insert(key.to_string(), generation);
+/// One local archive location: where its session sources live and how a
+/// source is identified in the file listing.
+pub struct Site {
+    pub harness: HarnessId,
+    /// Directory walked for file- and directory-based sources; the database
+    /// file itself for [`Kind::Db`].
+    pub path: PathBuf,
+    pub kind: Kind,
+}
+
+/// How a session source is identified inside a site's file listing.
+pub enum Kind {
+    /// Each file matching `rule` is one session. Paths with a component in
+    /// `exclude_dirs` are not sessions (Claude Code's `subagents` and
+    /// `tool-results` directories hold side files, not transcripts).
+    Files {
+        rule: FileRule,
+        exclude_dirs: &'static [&'static str],
+    },
+    /// A directory containing one of `markers` is one session.
+    SessionDirs { markers: &'static [&'static str] },
+    /// A directory holding `profile.json` or a `.jsonl` named after itself
+    /// is one Grok Bot session.
+    GrokBotDirs,
+    /// Sessions live inside the database at `path`; enumerated through
+    /// txcript only when the database fingerprint moves.
+    Db,
+}
+
+/// Which local files identify a session source for a file-backed store.
+#[derive(Clone, Copy)]
+pub enum FileRule {
+    /// Any file with this extension is a candidate session.
+    Ext(&'static str),
+    /// `local_*.json` records; the same-stem directory (audit log, project
+    /// transcript) belongs to the same session and joins the fingerprint.
+    CoworkRecord,
+}
+
+impl FileRule {
+    pub(crate) fn matches(&self, rel: &str) -> bool {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        match self {
+            Self::Ext(ext) => name
+                .rsplit_once('.')
+                .is_some_and(|(_, suffix)| suffix == *ext),
+            Self::CoworkRecord => name.starts_with("local_") && name.ends_with(".json"),
         }
     }
-    if let Some(store) = grok::GrokStore::default_root() {
-        open_paths(
-            HarnessId::Grok,
-            tree_generation(&store.sessions_dir),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
+
+    /// SQLite databases share their write state with `-wal`/`-shm` sidecars;
+    /// their stats belong to the session's fingerprint.
+    fn db_sidecars(&self) -> bool {
+        matches!(self, Self::Ext("db"))
     }
-    if let Some(store) = grok_bot::GrokBotStore::default_root() {
-        let generation = format!(
-            "{}\n{}",
-            tree_generation(&store.root),
-            store
-                .agents
-                .as_ref()
-                .map(|path| tree_generation(path))
-                .unwrap_or_else(|| "missing".into())
-        );
-        open_paths(
-            HarnessId::GrokBot,
-            generation,
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
+
+    /// Cowork records own a same-stem directory of session files.
+    fn extent_dir(&self) -> bool {
+        matches!(self, Self::CoworkRecord)
     }
-    if let Some(store) = fx::FxStore::default_root() {
-        open_paths(
-            HarnessId::Fx,
-            tree_generation(&store.sessions_dir),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
+}
+
+impl Kind {
+    /// Whether `rel` is a session file under the site root.
+    pub(crate) fn matches_file(&self, rel: &str) -> bool {
+        match self {
+            Self::Files { rule, exclude_dirs } => {
+                rule.matches(rel) && !rel.split('/').any(|part| exclude_dirs.contains(&part))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `rel` — a file at `parent/name` under the site root — marks
+    /// `parent` as a session directory.
+    pub(crate) fn is_dir_marker(&self, parent: &str, name: &str) -> bool {
+        match self {
+            Self::SessionDirs { markers } => markers.contains(&name),
+            Self::GrokBotDirs => {
+                let parent_name = parent.rsplit('/').next().unwrap_or(parent);
+                name == "profile.json"
+                    || name
+                        .strip_suffix(".jsonl")
+                        .is_some_and(|stem| stem == parent_name)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Every session store present on this machine.
+pub fn sites() -> Vec<Site> {
+    let mut sites = Vec::new();
+    if let Some(store) = claude_code::ClaudeStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::ClaudeCode,
+            path: store.root,
+            kind: Kind::Files {
+                rule: FileRule::Ext("jsonl"),
+                exclude_dirs: &["subagents", "tool-results"],
+            },
+        });
+    }
+    if let Some(store) = codex::CodexStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::Codex,
+            path: store.sessions_dir,
+            kind: Kind::Files {
+                rule: FileRule::Ext("jsonl"),
+                exclude_dirs: &[],
+            },
+        });
+    }
+    if let Some(store) = pi::PiStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::Pi,
+            path: store.sessions_dir,
+            kind: Kind::Files {
+                rule: FileRule::Ext("jsonl"),
+                exclude_dirs: &[],
+            },
+        });
+    }
+    if let Some(store) = campfire::CampfireStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::Campfire,
+            path: store.sessions_dir,
+            kind: Kind::Files {
+                rule: FileRule::Ext("jsonl"),
+                exclude_dirs: &[],
+            },
+        });
+    }
+    if let Some(store) = cursor::CursorStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::Cursor,
+            path: store.chats_dir,
+            kind: Kind::Files {
+                rule: FileRule::Ext("db"),
+                exclude_dirs: &[],
+            },
+        });
+    }
+    if let Some(store) = amp::AmpStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::Amp,
+            path: store.threads_dir,
+            kind: Kind::Files {
+                rule: FileRule::Ext("json"),
+                exclude_dirs: &[],
+            },
+        });
+    }
+    for store in antigravity_stores() {
+        sites.push(Site {
+            harness: HarnessId::Antigravity,
+            path: store.root.join("conversations"),
+            kind: Kind::Files {
+                rule: FileRule::Ext("db"),
+                exclude_dirs: &[],
+            },
+        });
     }
     if let Some(store) = cowork::CoworkStore::default_root() {
-        open_paths(
-            HarnessId::Cowork,
-            tree_generation(&store.root),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
+        sites.push(Site {
+            harness: HarnessId::Cowork,
+            path: store.root,
+            kind: Kind::Files {
+                rule: FileRule::CoworkRecord,
+                exclude_dirs: &[],
+            },
+        });
+    }
+    if let Some(store) = grok::GrokStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::Grok,
+            path: store.sessions_dir,
+            kind: Kind::SessionDirs {
+                markers: &["updates.jsonl", "chat_history.jsonl"],
+            },
+        });
+    }
+    if let Some(store) = grok_bot::GrokBotStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::GrokBot,
+            path: store.root,
+            kind: Kind::GrokBotDirs,
+        });
+        if let Some(agents) = store.agents {
+            sites.push(Site {
+                harness: HarnessId::GrokBot,
+                path: agents,
+                kind: Kind::GrokBotDirs,
+            });
+        }
+    }
+    if let Some(store) = fx::FxStore::default_root() {
+        sites.push(Site {
+            harness: HarnessId::Fx,
+            path: store.sessions_dir,
+            kind: Kind::SessionDirs {
+                markers: &["events.jsonl"],
+            },
+        });
     }
     if let Some(store) = hermes::HermesStore::default_root() {
-        open_ids(
-            HarnessId::Hermes,
-            db_fingerprint(&store.db_path),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
+        sites.push(Site {
+            harness: HarnessId::Hermes,
+            path: store.db_path,
+            kind: Kind::Db,
+        });
     }
     if let Some(store) = cursor_desktop::CursorDesktopStore::default_root() {
-        let db = store.user_dir.join("globalStorage").join("state.vscdb");
-        open_ids(
-            HarnessId::CursorDesktop,
-            db_fingerprint(&db),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
+        sites.push(Site {
+            harness: HarnessId::CursorDesktop,
+            path: store.user_dir.join("globalStorage").join("state.vscdb"),
+            kind: Kind::Db,
+        });
     }
     if let Some(store) = opencode::OpenCodeStore::default_db() {
-        open_ids(
-            HarnessId::OpenCode,
-            db_fingerprint(&store.db_path),
-            store,
-            stored_generations,
-            &mut collected,
-        )?;
+        sites.push(Site {
+            harness: HarnessId::OpenCode,
+            path: store.db_path,
+            kind: Kind::Db,
+        });
     }
-    Ok(collected)
+    sites
 }
 
 pub fn load(candidate: &Candidate) -> std::result::Result<Loaded, LoadFailure> {
     let transcript = read_transcript(candidate)?;
+    // Database-backed stores have no meaningful source mtime; directory
+    // sources report their newest member's mtime so freshness agrees with
+    // the scanned record.
     let updated_at = match candidate.harness {
         HarnessId::Hermes | HarnessId::CursorDesktop | HarnessId::OpenCode => None,
-        _ => file_mtime(Path::new(&candidate.source)),
+        _ => source_mtime(Path::new(&candidate.source)),
     };
     Ok(Loaded {
         transcript,
@@ -218,89 +285,56 @@ pub fn load(candidate: &Candidate) -> std::result::Result<Loaded, LoadFailure> {
     })
 }
 
-fn open_paths<S>(
-    harness: HarnessId,
-    generation: String,
-    store: S,
-    stored_generations: &BTreeMap<String, String>,
-    collected: &mut Collected,
-) -> Result<()>
-where
-    S: Store<Ref = PathBuf>,
-{
-    open_store(
-        harness,
-        generation,
-        store,
-        stored_generations,
-        collected,
-        |path| path.to_string_lossy().into_owned(),
-    )
+fn source_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    if path.is_dir() {
+        walk_tree(path)
+            .iter()
+            .map(|row| row.mtime_ns)
+            .max()
+            .map(mtime_datetime)
+    } else {
+        file_mtime(path)
+    }
 }
 
-fn open_ids<S>(
-    harness: HarnessId,
-    generation: String,
-    store: S,
-    stored_generations: &BTreeMap<String, String>,
-    collected: &mut Collected,
-) -> Result<()>
+/// Enumerate sessions of a database-backed store. Used by the source-state
+/// diff, which calls this only when the database fingerprint changed.
+pub fn discover_db_candidates(harness: HarnessId) -> Result<Vec<Candidate>> {
+    match harness {
+        HarnessId::Hermes => {
+            let store = hermes::HermesStore::default_root()
+                .ok_or_else(|| Error::msg("hermes store is unavailable"))?;
+            enumerate(harness, store)
+        }
+        HarnessId::CursorDesktop => {
+            let store = cursor_desktop::CursorDesktopStore::default_root()
+                .ok_or_else(|| Error::msg("cursor desktop store is unavailable"))?;
+            enumerate(harness, store)
+        }
+        HarnessId::OpenCode => {
+            let store = opencode::OpenCodeStore::default_db()
+                .ok_or_else(|| Error::msg("opencode store is unavailable"))?;
+            enumerate(harness, store)
+        }
+        _ => Err(Error::msg(format!(
+            "{harness} is not a database-backed store"
+        ))),
+    }
+}
+
+fn enumerate<S>(harness: HarnessId, store: S) -> Result<Vec<Candidate>>
 where
     S: Store<Ref = String>,
 {
-    open_store(
-        harness,
-        generation,
-        store,
-        stored_generations,
-        collected,
-        Clone::clone,
-    )
-}
-
-fn open_store<S, R>(
-    harness: HarnessId,
-    generation: String,
-    store: S,
-    stored_generations: &BTreeMap<String, String>,
-    collected: &mut Collected,
-    source_of: impl Fn(&R) -> String,
-) -> Result<()>
-where
-    S: Store<Ref = R>,
-    R: Clone,
-{
-    let key = harness.as_str();
-    if stored_generations.get(key) == Some(&generation) {
-        collected.quiet.push(harness);
-        collected.generations.insert(key.to_string(), generation);
-        return Ok(());
-    }
-    collected
-        .candidates
-        .extend(enumerate(harness, store, source_of)?);
-    collected.generations.insert(key.to_string(), generation);
-    Ok(())
-}
-
-fn enumerate<S, R>(
-    harness: HarnessId,
-    store: S,
-    source_of: impl Fn(&R) -> String,
-) -> Result<Vec<Candidate>>
-where
-    S: Store<Ref = R>,
-    R: Clone,
-{
     let discovered = store.discover().map_err(tx_error)?;
-    let refs: Vec<R> = discovered
+    let refs: Vec<String> = discovered
         .iter()
         .map(|item| item.reference.clone())
         .collect();
     let fingerprints = store.fingerprints(&refs).map_err(tx_error)?;
     let mut candidates = Vec::with_capacity(discovered.len());
     for item in &discovered {
-        let source = source_of(&item.reference);
+        let source = item.reference.clone();
         let fingerprint = fingerprints.get(&source).cloned().unwrap_or_default();
         candidates.push(Candidate {
             harness,
@@ -309,31 +343,6 @@ where
         });
     }
     Ok(candidates)
-}
-
-/// Enumerate sessions of a database-backed store. Used by the local state
-/// diff, which calls this only when the database fingerprint changed.
-pub fn discover_db_candidates(harness: HarnessId) -> Result<Vec<Candidate>> {
-    match harness {
-        HarnessId::Hermes => {
-            let store = hermes::HermesStore::default_root()
-                .ok_or_else(|| Error::msg("hermes store is unavailable"))?;
-            enumerate(harness, store, Clone::clone)
-        }
-        HarnessId::CursorDesktop => {
-            let store = cursor_desktop::CursorDesktopStore::default_root()
-                .ok_or_else(|| Error::msg("cursor desktop store is unavailable"))?;
-            enumerate(harness, store, Clone::clone)
-        }
-        HarnessId::OpenCode => {
-            let store = opencode::OpenCodeStore::default_db()
-                .ok_or_else(|| Error::msg("opencode store is unavailable"))?;
-            enumerate(harness, store, Clone::clone)
-        }
-        _ => Err(Error::msg(format!(
-            "{harness} is not a database-backed store"
-        ))),
-    }
 }
 
 fn read_transcript(candidate: &Candidate) -> std::result::Result<Transcript<Common>, LoadFailure> {
@@ -410,11 +419,16 @@ fn load_failure(error: txcript::Error) -> LoadFailure {
 }
 
 fn is_transient_io(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(32)
-        || matches!(
-            error.kind(),
-            ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-        )
+    // 32 is ERROR_SHARING_VIOLATION — Windows-only; on unix the same raw
+    // code means EPIPE, which is not a retryable source-read failure.
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(32) {
+        return true;
+    }
+    matches!(
+        error.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+    )
 }
 
 fn tx_error(error: txcript::Error) -> Error {
@@ -426,15 +440,21 @@ fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(modified))
 }
 
+pub(crate) fn mtime_datetime(mtime_ns: u128) -> DateTime<Utc> {
+    DateTime::<Utc>::from(
+        UNIX_EPOCH + std::time::Duration::from_nanos(u64::try_from(mtime_ns).unwrap_or(u64::MAX)),
+    )
+}
+
 pub(crate) fn db_fingerprint(path: &Path) -> String {
     [path, &sidecar(path, "-wal"), &sidecar(path, "-shm")]
         .into_iter()
-        .map(file_fingerprint)
+        .map(stat_fingerprint)
         .collect::<Vec<_>>()
         .join("|")
 }
 
-pub(crate) fn file_fingerprint(path: &Path) -> String {
+pub(crate) fn stat_fingerprint(path: &Path) -> String {
     match fs::metadata(path) {
         Err(_) => String::new(),
         Ok(meta) => {
@@ -457,8 +477,29 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn tree_generation(root: &Path) -> String {
-    hex::encode(tree_rows_hash(walk_tree(root).iter()))
+/// Fingerprint of one file-based session source within a walked tree. The
+/// site's rule decides which neighbouring rows join the fingerprint.
+pub(crate) fn row_fingerprint(index: usize, rows: &[TreeRow], site: &Site) -> String {
+    let row = &rows[index];
+    let mut fingerprint = format!("{}:{}", row.mtime_ns, row.size);
+    let Kind::Files { rule, .. } = &site.kind else {
+        return fingerprint;
+    };
+    if rule.db_sidecars() {
+        for suffix in ["-wal", "-shm"] {
+            let want = format!("{}{suffix}", row.rel);
+            if let Some(sidecar) = rows.iter().find(|row| row.rel == want) {
+                fingerprint.push_str(&format!("|{}:{}", sidecar.mtime_ns, sidecar.size));
+            }
+        }
+    }
+    if rule.extent_dir() {
+        let dir = row.rel.strip_suffix(".json").unwrap_or(&row.rel);
+        let prefix = format!("{dir}/");
+        let hash = dir_fingerprint(rows.iter().filter(|member| member.rel.starts_with(&prefix)));
+        fingerprint.push_str(&format!("|{hash}"));
+    }
+    fingerprint
 }
 
 /// One file under a store root, relative to the root.
@@ -482,7 +523,7 @@ fn tree_rows_hash<'a>(rows: impl Iterator<Item = &'a TreeRow>) -> Vec<u8> {
     let mut hasher = Sha256::new();
     for row in rows {
         hasher.update(format!("{}:{}:{}", row.rel, row.mtime_ns, row.size).as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(b"\n");
     }
     hasher.finalize().to_vec()
 }
@@ -491,6 +532,12 @@ fn tree_rows_hash<'a>(rows: impl Iterator<Item = &'a TreeRow>) -> Vec<u8> {
 /// directory (grok/fx/grok_bot session folders) rather than a single file.
 pub(crate) fn dir_fingerprint<'a>(rows: impl Iterator<Item = &'a TreeRow>) -> String {
     hex::encode(tree_rows_hash(rows))
+}
+
+/// Join a `/`-separated relative path under `root` using OS separators, so
+/// stored source strings stay canonical.
+pub(crate) fn join_rel(root: &Path, rel: &str) -> PathBuf {
+    root.join(rel.split('/').collect::<PathBuf>())
 }
 
 fn walk_rows(root: &Path, dir: &Path, rows: &mut Vec<TreeRow>) {
@@ -515,8 +562,15 @@ fn walk_rows(root: &Path, dir: &Path, rows: &mut Vec<TreeRow>) {
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_nanos());
         let relative = path.strip_prefix(root).unwrap_or(&path);
+        // Rows always use `/` separators so marker and exclusion matching is
+        // platform-independent.
+        let rel = relative
+            .iter()
+            .map(|component| component.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         rows.push(TreeRow {
-            rel: relative.to_string_lossy().into_owned(),
+            rel,
             mtime_ns: modified,
             size: meta.len(),
         });
@@ -540,4 +594,68 @@ pub fn antigravity_stores() -> Vec<antigravity::AntigravityStore> {
         }
     }
     stores
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn site(kind: Kind) -> Site {
+        Site {
+            harness: HarnessId::Codex,
+            path: PathBuf::from("/root"),
+            kind,
+        }
+    }
+
+    fn row(rel: &str, mtime_ns: u128, size: u64) -> TreeRow {
+        TreeRow {
+            rel: rel.into(),
+            mtime_ns,
+            size,
+        }
+    }
+
+    #[test]
+    fn file_sites_match_rules_and_skip_excluded_dirs() {
+        let files = Kind::Files {
+            rule: FileRule::Ext("jsonl"),
+            exclude_dirs: &["subagents", "tool-results"],
+        };
+        assert!(files.matches_file("a/b/session.jsonl"));
+        assert!(!files.matches_file("a/b/session.json"));
+        assert!(!files.matches_file("a/subagents/agent-1.jsonl"));
+        assert!(!files.matches_file("a/x/tool-results/t.jsonl"));
+        let db = Kind::Files {
+            rule: FileRule::Ext("db"),
+            exclude_dirs: &[],
+        };
+        assert!(db.matches_file("chat/store.db"));
+        assert!(!db.matches_file("chat/store.db-wal"));
+    }
+
+    #[test]
+    fn dir_sites_match_markers() {
+        let grok = Kind::SessionDirs {
+            markers: &["updates.jsonl", "chat_history.jsonl"],
+        };
+        assert!(grok.is_dir_marker("s1", "updates.jsonl"));
+        assert!(!grok.is_dir_marker("s1", "events.jsonl"));
+        let grok_bot = Kind::GrokBotDirs;
+        assert!(grok_bot.is_dir_marker("agents/bot-1", "profile.json"));
+        assert!(grok_bot.is_dir_marker("sessions/abc", "abc.jsonl"));
+        assert!(!grok_bot.is_dir_marker("sessions/abc", "other.jsonl"));
+    }
+
+    #[test]
+    fn fingerprints_cover_db_sidecars_and_cowork_extent() {
+        let site = site(Kind::Files {
+            rule: FileRule::Ext("db"),
+            exclude_dirs: &[],
+        });
+        let rows = vec![row("s/store.db", 1, 10), row("s/store.db-wal", 2, 4)];
+        let with_wal = row_fingerprint(0, &rows, &site);
+        let without_wal = row_fingerprint(0, &rows[..1], &site);
+        assert_ne!(with_wal, without_wal);
+    }
 }

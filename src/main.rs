@@ -212,6 +212,7 @@ mod tests {
 }
 
 async fn run() -> agent_transcript::Result<()> {
+    let launch_dir = config::release_launch_directory()?;
     match Cli::parse().command {
         Command::Init {
             account_id,
@@ -248,7 +249,7 @@ async fn run() -> agent_transcript::Result<()> {
         }
         Command::Ingest => agent_transcript::ingest::ingest().await,
         Command::Watch => agent_transcript::ingest::watch().await,
-        Command::Mcp => agent_transcript::mcp::serve()
+        Command::Mcp => agent_transcript::mcp::serve(&launch_dir)
             .await
             .map_err(agent_transcript::Error::msg),
         Command::Gc => agent_transcript::ingest::gc().await,
@@ -257,7 +258,7 @@ async fn run() -> agent_transcript::Result<()> {
             let key = config::load_key()?;
             let cache_dir = config::cache_dir()?;
             let r2 = agent_transcript::store::R2::new(&config);
-            let can_write = config.mode == config::Mode::Readwrite;
+            let can_write = config.can_write();
             let mut local = agent_transcript::local_state::LocalStore::load(&cache_dir);
             let snapshot = if can_write {
                 agent_transcript::search_index::build_for_cwd(
@@ -265,6 +266,7 @@ async fn run() -> agent_transcript::Result<()> {
                     &key,
                     &cache_dir,
                     cwd.as_deref(),
+                    &launch_dir,
                     true,
                     &mut local,
                 )
@@ -275,6 +277,7 @@ async fn run() -> agent_transcript::Result<()> {
                     &key,
                     &cache_dir,
                     cwd.as_deref(),
+                    &launch_dir,
                 )
                 .await?
                 {
@@ -285,6 +288,7 @@ async fn run() -> agent_transcript::Result<()> {
                             &key,
                             &cache_dir,
                             cwd.as_deref(),
+                            &launch_dir,
                             false,
                             &mut local,
                         )

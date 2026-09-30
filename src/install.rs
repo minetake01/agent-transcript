@@ -17,10 +17,8 @@ pub fn install() -> Result<PathBuf> {
 
 #[cfg(windows)]
 fn install_windows() -> Result<PathBuf> {
-    use crate::config::{self, Mode};
-
-    let config = config::load_config()?;
-    if config.mode == Mode::Read {
+    let config = crate::config::load_config()?;
+    if !config.can_write() {
         return Err(Error::msg("mode is read; refusing to schedule watch"));
     }
     let exe = current_executable()?;

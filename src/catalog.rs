@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use txcript::HarnessId;
 
 use crate::error::{Error, Result};
-use crate::merge::{choose_current, prefer, Current, Freshness, Side};
+use crate::merge::{choose_current, prefer, Current, Freshness, Info, Preference};
 
 pub const CATALOG_KEY: &str = "v1/catalog";
 pub const SCHEMA: u32 = 1;
@@ -26,16 +25,11 @@ pub struct SessionRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revision {
-    pub content_hash: String,
     pub object_key: String,
-    pub title: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub updated_at: Option<DateTime<Utc>>,
-    pub last_message_at: Option<DateTime<Utc>>,
-    pub cwd: Option<String>,
-    pub git_branch: Option<String>,
-    pub model: Option<String>,
-    pub message_count: u64,
+    #[serde(flatten)]
+    pub freshness: Freshness,
+    #[serde(flatten)]
+    pub info: Info,
     /// Compressed ciphertext bytes stored under `object_key`. Zero for
     /// revisions written before the field existed.
     #[serde(default)]
@@ -48,12 +42,6 @@ impl Catalog {
             schema: SCHEMA,
             sessions: Vec::new(),
         }
-    }
-
-    pub fn session(&self, harness: HarnessId, session_id: &str) -> Option<&SessionRecord> {
-        self.sessions
-            .iter()
-            .find(|session| session.harness == harness && session.session_id == session_id)
     }
 }
 
@@ -84,11 +72,9 @@ pub fn merge_catalogs(base: &Catalog, incoming: &Catalog) -> Result<Catalog> {
                 )));
             }
             for revision in &incoming_session.revisions {
-                if !existing
-                    .revisions
-                    .iter()
-                    .any(|current| current.content_hash == revision.content_hash)
-                {
+                if !existing.revisions.iter().any(|current| {
+                    current.freshness.content_hash == revision.freshness.content_hash
+                }) {
                     existing.revisions.push(revision.clone());
                 }
             }
@@ -103,9 +89,11 @@ pub fn merge_catalogs(base: &Catalog, incoming: &Catalog) -> Result<Catalog> {
             .then(left.session_id.cmp(&right.session_id))
     });
     for session in &mut sessions {
-        session
-            .revisions
-            .sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
+        session.revisions.sort_by(|left, right| {
+            left.freshness
+                .content_hash
+                .cmp(&right.freshness.content_hash)
+        });
         if session.revisions.is_empty() {
             return Err(Error::msg(format!(
                 "session {} {} has no revisions",
@@ -147,12 +135,7 @@ pub fn prune_to_current(catalog: &mut Catalog) {
         let ranked = session
             .revisions
             .iter()
-            .map(|revision| Freshness {
-                updated_at: revision.updated_at,
-                last_message_at: revision.last_message_at,
-                message_count: revision.message_count,
-                content_hash: revision.content_hash.clone(),
-            })
+            .map(|revision| revision.freshness.clone())
             .collect::<Vec<_>>();
         let best = match choose_current(&ranked) {
             Ok(Current::Index(index)) | Ok(Current::Ambiguous { display: index }) => index,
@@ -160,16 +143,16 @@ pub fn prune_to_current(catalog: &mut Catalog) {
         };
         let mut by_hash: HashMap<&str, usize> = HashMap::new();
         for (index, revision) in session.revisions.iter().enumerate() {
-            if matches!(prefer(&ranked[index], &ranked[best]), Ok(Side::Remote)) {
+            if matches!(prefer(&ranked[index], &ranked[best]), Preference::Remote) {
                 continue;
             }
-            match by_hash.get(revision.content_hash.as_str()) {
+            match by_hash.get(revision.freshness.content_hash.as_str()) {
                 None => {
-                    by_hash.insert(revision.content_hash.as_str(), index);
+                    by_hash.insert(revision.freshness.content_hash.as_str(), index);
                 }
                 // Prefer the winner's own metadata among same-body duplicates.
                 Some(_) if index == best => {
-                    by_hash.insert(revision.content_hash.as_str(), index);
+                    by_hash.insert(revision.freshness.content_hash.as_str(), index);
                 }
                 Some(_) => {}
             }
@@ -208,11 +191,11 @@ pub fn validate(catalog: &Catalog) -> Result<()> {
             )));
         }
         for revision in &session.revisions {
-            let expected = object_key(&revision.content_hash)?;
+            let expected = object_key(&revision.freshness.content_hash)?;
             if revision.object_key != expected {
                 return Err(Error::msg(format!(
                     "revision {} is stored at `{}` instead of `{expected}`",
-                    revision.content_hash, revision.object_key
+                    revision.freshness.content_hash, revision.object_key
                 )));
             }
         }
@@ -223,6 +206,7 @@ pub fn validate(catalog: &Catalog) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
 
     fn at(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(secs, 0).unwrap()
@@ -230,16 +214,20 @@ mod tests {
 
     fn revision(hash: &str, messages: u64, updated: Option<i64>) -> Revision {
         Revision {
-            content_hash: hash.to_string(),
             object_key: object_key(hash).unwrap(),
-            title: None,
-            started_at: at(1),
-            updated_at: updated.map(at),
-            last_message_at: None,
-            cwd: None,
-            git_branch: None,
-            model: None,
-            message_count: messages,
+            freshness: Freshness {
+                content_hash: hash.to_string(),
+                updated_at: updated.map(at),
+                last_message_at: None,
+                message_count: messages,
+            },
+            info: Info {
+                title: None,
+                started_at: at(1),
+                cwd: None,
+                git_branch: None,
+                model: None,
+            },
             size: 0,
         }
     }
@@ -269,18 +257,13 @@ mod tests {
         let freshness = record
             .revisions
             .iter()
-            .map(|revision| crate::merge::Freshness {
-                updated_at: revision.updated_at,
-                last_message_at: revision.last_message_at,
-                message_count: revision.message_count,
-                content_hash: revision.content_hash.clone(),
-            })
+            .map(|revision| revision.freshness.clone())
             .collect::<Vec<_>>();
         assert_eq!(
             crate::merge::choose_current(&freshness).unwrap(),
             crate::merge::Current::Index(1)
         );
-        assert_eq!(record.revisions[1].content_hash, "bb22");
+        assert_eq!(record.revisions[1].freshness.content_hash, "bb22");
     }
 
     #[test]
@@ -325,7 +308,7 @@ mod tests {
         let hashes: Vec<&str> = catalog.sessions[0]
             .revisions
             .iter()
-            .map(|r| r.content_hash.as_str())
+            .map(|r| r.freshness.content_hash.as_str())
             .collect();
         // aa11 is strictly older; bb22 and cc33 tie at the newest rank
         // (same time and count, different bodies) and the duplicate bb22
@@ -344,6 +327,9 @@ mod tests {
         };
         prune_to_current(&mut catalog);
         assert_eq!(catalog.sessions[0].revisions.len(), 1);
-        assert_eq!(catalog.sessions[0].revisions[0].content_hash, "bb22");
+        assert_eq!(
+            catalog.sessions[0].revisions[0].freshness.content_hash,
+            "bb22"
+        );
     }
 }

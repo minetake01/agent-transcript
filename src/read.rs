@@ -35,10 +35,7 @@ fn over_budget(src: &str, transcript: &Transcript<Common>, span: &Span, rendered
     let shown = chunks
         .iter()
         .take(12)
-        .map(|range| match range.len() {
-            1 => format!("`{src}#{}`", range.start + 1),
-            _ => format!("`{src}#{}-{}`", range.start + 1, range.end),
-        })
+        .map(|range| format!("`{src}{}`", format_span(&Span(range.clone()))))
         .collect::<Vec<_>>()
         .join(", ");
     let more = if chunks.len() > 12 { ", …" } else { "" };
@@ -63,8 +60,4 @@ fn chunk_ranges(sizes: &[usize], start: usize, budget: usize) -> Vec<std::ops::R
         chunks.push(start + lo..start + sizes.len());
     }
     chunks
-}
-
-pub fn suggest_span(span: &Span) -> String {
-    format_span(span)
 }

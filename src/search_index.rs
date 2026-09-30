@@ -1,16 +1,15 @@
 //! Durable, per-repository search snapshots.
 //!
-//! The ordinary search cache stores one extracted transcript at a time. That is
-//! useful while a snapshot is being built, but it still forces the MCP server
-//! to rediscover every local session and to rebuild an in-memory index on every
-//! query. A snapshot contains the complete searchable set for one repository
-//! and can therefore be used directly by the query path.
+//! A snapshot contains the complete searchable set for one repository and is
+//! served directly by the query path — the MCP server does not rediscover
+//! sessions or rebuild an in-memory index per query. Full rebuilds reuse the
+//! previous snapshot's extracted documents when a source's fingerprint is
+//! unchanged.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use txcript::search::{DocKey, Extracted, Index};
@@ -20,7 +19,6 @@ use crate::error::{Error, Result};
 use crate::local_state::LocalStore;
 use crate::merge::{MergedView, Pick};
 use crate::repo_id;
-use crate::search_cache;
 use crate::sessions;
 use crate::store::{Precondition, R2};
 
@@ -42,8 +40,6 @@ pub struct Snapshot {
     format: String,
     repo_key: String,
     generation: String,
-    catalog_etag: Option<String>,
-    generated_at: DateTime<Utc>,
     documents: Vec<Document>,
 }
 
@@ -63,8 +59,6 @@ struct Document {
 pub struct Runtime {
     pub index: Index,
     repo_key: String,
-    catalog_etag: Option<String>,
-    generated_at: DateTime<Utc>,
     documents: HashMap<DocKey, DocEntry>,
     dirty: bool,
 }
@@ -78,16 +72,27 @@ impl Snapshot {
     /// Build a snapshot from merged views.
     ///
     /// This is intentionally the slow path: it may read local transcripts and
-    /// fetch remote objects. Once it completes, all subsequent searches can use
-    /// the resulting snapshot without doing that work again.
+    /// fetch remote objects. Documents whose fingerprint is unchanged from
+    /// the previous local snapshot are reused without re-reading them. Once
+    /// the snapshot completes, all subsequent searches use it directly.
     pub async fn from_merged(
         repo_key: &str,
-        catalog_etag: Option<String>,
         merged: &[MergedView],
         r2: &R2,
         encryption_key: &Key,
         cache_dir: &Path,
     ) -> Result<Self> {
+        // Seed from the previous snapshot: an unchanged (doc, fingerprint)
+        // needs no transcript read at all.
+        let mut prior: HashMap<(DocKey, String), Extracted> = load_local(cache_dir, repo_key)?
+            .map(|snapshot| {
+                snapshot
+                    .documents
+                    .into_iter()
+                    .map(|document| ((document.key, document.fingerprint), document.extracted))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut documents = Vec::new();
 
         for view in merged {
@@ -103,25 +108,14 @@ impl Snapshot {
             let extracted = if fingerprint.is_empty() {
                 None
             } else {
-                search_cache::get(cache_dir, repo_key, view, &fingerprint, &doc_key)
+                prior.remove(&(doc_key.clone(), fingerprint.clone()))
             };
             let extracted = match extracted {
                 Some(extracted) => extracted,
                 None => {
                     let transcript =
                         sessions::transcript(r2, encryption_key, cache_dir, view).await?;
-                    let extracted = Extracted::new(doc_key.clone(), &transcript);
-                    if !fingerprint.is_empty() {
-                        search_cache::put(
-                            cache_dir,
-                            repo_key,
-                            view,
-                            &fingerprint,
-                            doc_key.clone(),
-                            &extracted,
-                        );
-                    }
-                    extracted
+                    Extracted::new(doc_key.clone(), &transcript)
                 }
             };
             documents.push(Document {
@@ -145,16 +139,10 @@ impl Snapshot {
             format: FORMAT.to_string(),
             repo_key: repo_key.to_string(),
             generation,
-            catalog_etag,
-            generated_at: Utc::now(),
             documents,
         };
         save_local(cache_dir, &snapshot)?;
-        // Per-document files are only a build accelerator. Keep their bounded
-        // LRU behavior when a full snapshot is (re)built, never on the hot
-        // query path.
-        search_cache::prune(cache_dir);
-        search_cache::prune_plaintext(cache_dir);
+        crate::remote::prune_plaintext_cache(cache_dir);
         Ok(snapshot)
     }
 
@@ -162,8 +150,6 @@ impl Snapshot {
     pub fn into_runtime(self) -> Runtime {
         let Snapshot {
             repo_key,
-            catalog_etag,
-            generated_at,
             documents,
             ..
         } = self;
@@ -184,8 +170,6 @@ impl Snapshot {
         Runtime {
             index,
             repo_key,
-            catalog_etag,
-            generated_at,
             documents: map,
             dirty: false,
         }
@@ -197,14 +181,6 @@ impl Snapshot {
 
     pub fn generation(&self) -> &str {
         &self.generation
-    }
-
-    pub fn generated_at(&self) -> DateTime<Utc> {
-        self.generated_at
-    }
-
-    pub fn catalog_etag(&self) -> Option<&str> {
-        self.catalog_etag.as_deref()
     }
 
     pub fn documents(&self) -> usize {
@@ -251,8 +227,6 @@ impl Runtime {
         Self {
             index: Index::new(),
             repo_key: repo_key.to_string(),
-            catalog_etag: None,
-            generated_at: Utc::now(),
             documents: HashMap::new(),
             dirty: false,
         }
@@ -260,10 +234,6 @@ impl Runtime {
 
     pub fn repo_key(&self) -> &str {
         &self.repo_key
-    }
-
-    pub fn generated_at(&self) -> DateTime<Utc> {
-        self.generated_at
     }
 
     pub fn documents(&self) -> usize {
@@ -291,14 +261,12 @@ impl Runtime {
             },
         );
         self.dirty = true;
-        self.generated_at = Utc::now();
     }
 
     pub fn remove(&mut self, key: &DocKey) {
         self.index.remove(key);
         if self.documents.remove(key).is_some() {
             self.dirty = true;
-            self.generated_at = Utc::now();
         }
     }
 
@@ -327,8 +295,6 @@ impl Runtime {
             format: FORMAT.to_string(),
             repo_key: self.repo_key.clone(),
             generation,
-            catalog_etag: self.catalog_etag.clone(),
-            generated_at: self.generated_at,
             documents,
         })
     }
@@ -347,16 +313,14 @@ impl Runtime {
 
 /// Path of the local snapshot for a repository.
 pub fn local_path(cache_dir: &Path, repo_key: &str) -> PathBuf {
-    let digest = Sha256::digest(repo_key.as_bytes());
     cache_dir
         .join(LOCAL_DIRECTORY)
-        .join(format!("{}.json", hex::encode(digest)))
+        .join(format!("{}.json", crate::fsutil::repo_digest(repo_key)))
 }
 
 /// Object key of the encrypted R2 snapshot for a repository.
 pub fn remote_key(repo_key: &str) -> String {
-    let digest = Sha256::digest(repo_key.as_bytes());
-    format!("{REMOTE_PREFIX}/{}", hex::encode(digest))
+    format!("{REMOTE_PREFIX}/{}", crate::fsutil::repo_digest(repo_key))
 }
 
 /// Load and validate a local snapshot. A missing file is not an error.
@@ -375,7 +339,7 @@ pub fn load_local(cache_dir: &Path, repo_key: &str) -> Result<Option<Snapshot>> 
 /// Save a snapshot locally using an atomic replacement.
 pub fn save_local(cache_dir: &Path, snapshot: &Snapshot) -> Result<()> {
     snapshot.validate(Some(snapshot.repo_key()))?;
-    atomic_write(
+    crate::fsutil::atomic_write(
         &local_path(cache_dir, snapshot.repo_key()),
         &snapshot.to_bytes()?,
     )
@@ -417,22 +381,20 @@ pub async fn publish_remote_bytes(r2: &R2, key: &Key, repo_key: &str, plain: &[u
     r2.put(&object, encrypted, Precondition::None).await
 }
 
-/// Build, cache, and optionally publish the index for one local directory.
-pub async fn build_for_directory(
+/// Build, cache, and optionally publish the index for one repository.
+pub async fn build_for_repo(
     r2: &R2,
     key: &Key,
     cache_dir: &Path,
-    directory: &Path,
+    repo_key: &str,
     publish: bool,
     local: &mut LocalStore,
 ) -> Result<Snapshot> {
-    let repo_key = repo_id::origin_of(directory).map_err(|error| Error::msg(error.to_string()))?;
-    let (catalog, catalog_etag) = crate::remote::load_catalog(r2, key).await?;
+    let (catalog, _) = crate::remote::load_catalog(r2, key).await?;
     local.diff()?;
     let locals = sessions::local_views(local)?;
-    let merged = sessions::merged(&repo_key, None, &locals, &catalog)?;
-    let snapshot =
-        Snapshot::from_merged(&repo_key, catalog_etag, &merged, r2, key, cache_dir).await?;
+    let merged = sessions::merged(repo_key, None, &locals, &catalog)?;
+    let snapshot = Snapshot::from_merged(repo_key, &merged, r2, key, cache_dir).await?;
     if publish {
         publish_remote(r2, key, &snapshot).await?;
     }
@@ -447,11 +409,12 @@ pub async fn build_for_cwd(
     key: &Key,
     cache_dir: &Path,
     cwd: Option<&str>,
+    process_dir: &Path,
     publish: bool,
     local: &mut LocalStore,
 ) -> Result<Snapshot> {
-    let directory = requested_directory(cwd)?;
-    build_for_directory(r2, key, cache_dir, &directory, publish, local).await
+    let repo_key = requested_repo_key(cwd, process_dir)?;
+    build_for_repo(r2, key, cache_dir, &repo_key, publish, local).await
 }
 
 /// Download an already published index without scanning local stores.
@@ -463,24 +426,23 @@ pub async fn download_for_cwd(
     key: &Key,
     cache_dir: &Path,
     cwd: Option<&str>,
+    process_dir: &Path,
 ) -> Result<Option<Snapshot>> {
-    let directory = requested_directory(cwd)?;
-    let repo_key = repo_id::origin_of(&directory).map_err(|error| Error::msg(error.to_string()))?;
+    let repo_key = requested_repo_key(cwd, process_dir)?;
     load_remote(r2, key, cache_dir, &repo_key).await
 }
 
-fn requested_directory(cwd: Option<&str>) -> Result<PathBuf> {
-    let process = std::env::current_dir()?;
-    let directory = repo_id::scope_directory(cwd.map(Path::new), &process);
+/// Resolve a requested cwd to its repository key once: the same normalization
+/// and origin probe every entry point shares.
+fn requested_repo_key(cwd: Option<&str>, process_dir: &Path) -> Result<String> {
+    let directory = repo_id::scope_directory(cwd.map(Path::new), process_dir);
     if !directory.is_dir() {
         return Err(Error::msg(format!(
             "{} is not a directory",
             directory.display()
         )));
     }
-    // Resolve once here so a malformed origin fails before the expensive scan.
-    let _ = repo_id::origin_of(&directory).map_err(|error| Error::msg(error.to_string()))?;
-    Ok(directory)
+    repo_id::origin_of(&directory).map_err(|error| Error::msg(error.to_string()))
 }
 
 fn generation(documents: &[Document]) -> Result<String> {
@@ -491,32 +453,6 @@ fn generation(documents: &[Document]) -> Result<String> {
         hasher.update(&bytes);
     }
     Ok(hex::encode(hasher.finalize()))
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::msg("search index path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("snapshot"),
-        rand::random::<u64>()
-    ));
-    fs::write(&temporary, bytes)?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        // Windows cannot replace an existing file with rename.
-        if path.exists() {
-            fs::remove_file(path)?;
-            fs::rename(&temporary, path)?;
-        } else {
-            let _ = fs::remove_file(&temporary);
-            return Err(error.into());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -571,8 +507,6 @@ mod tests {
             format: FORMAT.into(),
             repo_key: repo.into(),
             generation: generation(&documents).unwrap(),
-            catalog_etag: Some("etag".into()),
-            generated_at: Utc::now(),
             documents,
         }
     }

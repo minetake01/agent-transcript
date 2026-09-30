@@ -15,7 +15,6 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use txcript::search::{Case, DocKey, Extracted, Hit, Origin, Query};
 use txcript::HarnessId;
-use url::Url;
 
 use crate::catalog::{Catalog, CATALOG_KEY};
 use crate::config;
@@ -60,7 +59,7 @@ const STANDARD_FORMATS: &[&str] = &[
 struct ListSessionsRequest {
     /// Only include this harness. Omit to include every harness in the repository.
     from: Option<String>,
-    /// Directory whose git origin selects the repository. Omit to use the client workspace, or the process working directory when the client reports no workspace.
+    /// Directory whose git origin selects the repository. Omit to use the client workspace, or the directory the server was launched from when the client reports no workspace.
     cwd: Option<String>,
     /// Return at most this many sessions. Omit for no cap.
     limit: Option<usize>,
@@ -75,7 +74,7 @@ struct SearchSessionsRequest {
     pattern: String,
     /// Search only this harness. Omit to search every harness in the repository.
     from: Option<String>,
-    /// Directory whose git origin selects the repository. Omit to use the client workspace, or the process working directory when the client reports no workspace.
+    /// Directory whose git origin selects the repository. Omit to use the client workspace, or the directory the server was launched from when the client reports no workspace.
     cwd: Option<String>,
 }
 
@@ -86,7 +85,7 @@ struct ReadSessionRequest {
     id: String,
     /// Only look in this harness. Omit to look across every harness in the repository.
     from: Option<String>,
-    /// Directory whose git origin selects the repository. Omit to use the client workspace, or this process's working directory when the client reports no workspace.
+    /// Directory whose git origin selects the repository. Omit to use the client workspace, or the directory the server was launched from when the client reports no workspace.
     cwd: Option<String>,
 }
 
@@ -133,6 +132,10 @@ struct App {
     r2: R2,
     key: crate::crypto::Key,
     cache_dir: std::path::PathBuf,
+    /// Directory the process was launched in — the working-directory
+    /// fallback for an omitted `cwd`. The process itself re-anchors to the
+    /// cache directory at startup so it never pins the launcher's directory.
+    launch_dir: PathBuf,
     can_write: bool,
     /// Persistent per-source session records; `diff()` refreshes them with a
     /// stat-only scan on every request.
@@ -187,7 +190,7 @@ impl ArchiveServer {
 #[tool_router]
 impl ArchiveServer {
     #[tool(
-        description = "List coding-agent sessions for one repository, newest first. Local sessions and the R2 archive are merged; the same harness and session id appear once. `cwd` selects the repository by its git origin, not by the recorded path. Omit `cwd` to use the client workspace, or this process's working directory when the client reports no workspace. Omit `from` to include every harness in that repository. `limit` and `offset` page the merged list; `total` is the count before paging.",
+        description = "List coding-agent sessions for one repository, newest first. Local sessions and the R2 archive are merged; the same harness and session id appear once. `cwd` selects the repository by its git origin, not by the recorded path. Omit `cwd` to use the client workspace, or the directory the server was launched from when the client reports no workspace. Omit `from` to include every harness in that repository. `limit` and `offset` page the merged list; `total` is the count before paging.",
         annotations(title = "List sessions", read_only_hint = true)
     )]
     async fn list_sessions(
@@ -214,7 +217,7 @@ impl ArchiveServer {
     }
 
     #[tool(
-        description = "Search coding-agent sessions in one repository for a literal substring. Local sessions and the R2 archive are merged first. `cwd` selects the repository by its git origin. Omit `cwd` to use the client workspace, or this process's working directory when the client reports no workspace. Omit `from` to search every harness in that repository.",
+        description = "Search coding-agent sessions in one repository for a literal substring. Local sessions and the R2 archive are merged first. `cwd` selects the repository by its git origin. Omit `cwd` to use the client workspace, or the directory the server was launched from when the client reports no workspace. Omit `from` to search every harness in that repository.",
         annotations(title = "Search sessions", read_only_hint = true)
     )]
     async fn search_sessions(
@@ -236,7 +239,7 @@ impl ArchiveServer {
     }
 
     #[tool(
-        description = "Read one session from the merged local and R2 archive as token-optimized text. `id` is a session id, unambiguous prefix, or exact title. Append `#range` (1-based inclusive, for example `abc#5-12`) to read part of it. Reads over the byte budget are refused with suggested ranges. `from` limits the harness. `cwd` selects the repository by its git origin. Omit `cwd` to use the client workspace, or this process's working directory when the client reports no workspace.",
+        description = "Read one session from the merged local and R2 archive as token-optimized text. `id` is a session id, unambiguous prefix, or exact title. Append `#range` (1-based inclusive, for example `abc#5-12`) to read part of it. Reads over the byte budget are refused with suggested ranges. `from` limits the harness. `cwd` selects the repository by its git origin. Omit `cwd` to use the client workspace, or the directory the server was launched from when the client reports no workspace.",
         annotations(title = "Read session", read_only_hint = true)
     )]
     async fn read_session(
@@ -374,14 +377,7 @@ impl ArchiveServer {
         let path = self.app.cache_dir.join("catalog.json");
         let result = serde_json::to_vec(&cache)
             .map_err(Error::from)
-            .and_then(|bytes| {
-                let temp = path.with_extension("json.tmp");
-                std::fs::write(&temp, &bytes).map_err(Error::from)?;
-                if path.exists() {
-                    std::fs::remove_file(&path)?;
-                }
-                std::fs::rename(&temp, &path).map_err(Error::from)
-            });
+            .and_then(|bytes| crate::fsutil::atomic_write(&path, &bytes));
         if let Err(error) = result {
             eprintln!("agent-transcript: caching catalog: {error}");
         }
@@ -393,8 +389,15 @@ impl ArchiveServer {
         peer: &Peer<RoleServer>,
     ) -> Result<PathBuf, ErrorData> {
         match cwd {
-            Some(cwd) => Ok(PathBuf::from(cwd)),
-            None => directory_for_omitted_cwd(peer).await.map_err(tool_error),
+            // The same normalization the `index` command applies: file URIs,
+            // `/d:/…` forms, and relative paths anchored at the launch dir.
+            Some(cwd) => Ok(repo_id::scope_directory(
+                Some(Path::new(cwd)),
+                &self.app.launch_dir,
+            )),
+            None => directory_for_omitted_cwd(peer, &self.app.launch_dir)
+                .await
+                .map_err(tool_error),
         }
     }
 
@@ -565,18 +568,19 @@ struct ResolvedRoot {
     origin: String,
 }
 
-async fn directory_for_omitted_cwd(peer: &Peer<RoleServer>) -> crate::Result<PathBuf> {
+async fn directory_for_omitted_cwd(
+    peer: &Peer<RoleServer>,
+    launch_dir: &Path,
+) -> crate::Result<PathBuf> {
     if client_has_roots(peer) {
         let roots = list_workspace_roots(peer).await?;
         if !roots.is_empty() {
             return directory_from_roots(&roots);
         }
     }
-    let process = std::env::current_dir()?;
-    match repo_id::origin_of(&process) {
-        Ok(_) => Ok(process),
-        Err(error) => Err(Error::msg(error.to_string())),
-    }
+    // The launch directory is always the answer; a missing or malformed
+    // origin surfaces from the repo-key resolution that follows.
+    Ok(launch_dir.to_path_buf())
 }
 
 fn client_has_roots(peer: &Peer<RoleServer>) -> bool {
@@ -629,19 +633,11 @@ fn origin_at(dir: &Path) -> crate::Result<Option<String>> {
 }
 
 fn root_directory(uri: &str) -> crate::Result<PathBuf> {
-    let path = if uri.starts_with("file:") {
-        let url = Url::parse(uri).map_err(|error| {
-            Error::msg(format!("workspace root `{uri}` is not a file URI: {error}"))
-        })?;
-        url.to_file_path()
-            .map_err(|_| Error::msg(format!("workspace root `{uri}` is not a local path")))?
-    } else {
-        PathBuf::from(uri)
-    };
-    if !path.is_absolute() {
+    // Shared cwd normalization: file URIs and `/d:/…` forms become paths.
+    let path = repo_id::normalize_cwd(uri);
+    if path.as_os_str().is_empty() || !path.is_absolute() {
         return Err(Error::msg(format!(
-            "workspace root `{}` is not absolute",
-            path.display()
+            "workspace root `{uri}` is not absolute"
         )));
     }
     Ok(path)
@@ -677,12 +673,12 @@ impl ServerHandler for ArchiveServer {
                     ),
             )
             .with_instructions(
-                "Use list_sessions, search_sessions, and read_session. They read this PC's local sessions and the encrypted R2 archive together. cwd is a directory whose git origin selects the repository; omit it to use the client workspace, or the process working directory when the client reports no workspace. Append #5-12 to a session id to read that message range.",
+                "Use list_sessions, search_sessions, and read_session. They read this PC's local sessions and the encrypted R2 archive together. cwd is a directory whose git origin selects the repository; omit it to use the client workspace, or the directory the server was launched from when the client reports no workspace. Append #5-12 to a session id to read that message range.",
             )
     }
 }
 
-pub async fn serve() -> Result<(), String> {
+pub async fn serve(launch_dir: &Path) -> Result<(), String> {
     let config = config::load_config().map_err(|error| error.to_string())?;
     let key = config::load_key().map_err(|error| error.to_string())?;
     let cache_dir = config::cache_dir().map_err(|error| error.to_string())?;
@@ -703,7 +699,8 @@ pub async fn serve() -> Result<(), String> {
         r2: R2::new(&config),
         key,
         cache_dir: cache_dir.clone(),
-        can_write: config.mode == config::Mode::Readwrite,
+        launch_dir: launch_dir.to_path_buf(),
+        can_write: config.can_write(),
         local: Mutex::new(LocalStore::load(&cache_dir)),
         catalog: RwLock::new(catalog),
         catalog_sync: tokio::sync::Mutex::new(()),
@@ -761,11 +758,11 @@ fn summary(view: &crate::merge::MergedView) -> SessionSummary {
     SessionSummary {
         harness: view.harness.to_string(),
         id: view.session_id.clone(),
-        timestamp: view.started_at.to_rfc3339(),
-        title: view.title.clone(),
-        cwd: view.cwd.clone(),
-        git_branch: view.git_branch.clone(),
-        model: view.model.clone(),
+        timestamp: view.info.started_at.to_rfc3339(),
+        title: view.info.title.clone(),
+        cwd: view.info.cwd.clone(),
+        git_branch: view.info.git_branch.clone(),
+        model: view.info.model.clone(),
     }
 }
 

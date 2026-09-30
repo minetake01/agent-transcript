@@ -1,11 +1,16 @@
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use crate::catalog::{merge_catalogs, validate, Catalog, CATALOG_KEY};
 use crate::crypto::{self, Key};
 use crate::document::{hash_bytes, ArchiveDocument};
 use crate::error::{Error, Result};
 use crate::store::{Precondition, R2};
+
+/// Decrypted object cache bounds: 512 MiB and 30 days.
+const PLAINTEXT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const PLAINTEXT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 pub async fn load_catalog(r2: &R2, key: &Key) -> Result<(Catalog, Option<String>)> {
     match r2.get(CATALOG_KEY).await? {
@@ -69,10 +74,55 @@ pub async fn load_plaintext(
             "object `{object_key}` does not match catalog hash `{content_hash}`"
         )));
     }
-    fs::create_dir_all(cache_dir)?;
-    fs::write(&cached, &plain)?;
-    crate::search_cache::prune_plaintext(cache_dir);
+    crate::fsutil::atomic_write(&cached, &plain)?;
+    prune_plaintext_cache(cache_dir);
     Ok(plain)
+}
+
+/// Remove old plaintext objects and evict least recently used ones over the
+/// size budget. Only the content-hash-named `.json` files this module writes
+/// are touched.
+pub fn prune_plaintext_cache(dir: &Path) {
+    let Ok(files) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut entries = Vec::new();
+    for file in files.flatten() {
+        let path = file.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(meta) = file.metadata() else { continue };
+        // Only files this cache writes — a 64-hex-char content hash stem.
+        if !path.extension().is_some_and(|ext| ext == "json")
+            || !path.file_stem().is_some_and(|stem| {
+                let name = stem.to_string_lossy();
+                name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > PLAINTEXT_MAX_AGE)
+        {
+            let _ = fs::remove_file(path);
+        } else {
+            entries.push((path, modified, meta.len()));
+        }
+    }
+    entries.sort_by_key(|(_, modified, _)| *modified);
+    let mut total: u64 = entries.iter().map(|(_, _, size)| size).sum();
+    for (path, _, size) in entries {
+        if total <= PLAINTEXT_MAX_BYTES {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            total -= size;
+        }
+    }
 }
 
 pub fn document_from_plaintext(bytes: &[u8]) -> Result<ArchiveDocument> {

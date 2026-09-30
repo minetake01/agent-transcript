@@ -46,15 +46,55 @@ impl Config {
         )
     }
 
+    /// Whether this installation may write to R2.
+    pub fn can_write(&self) -> bool {
+        self.mode == Mode::Readwrite
+    }
+
     pub fn require_write(&self) -> Result<()> {
-        if self.mode == Mode::Read {
+        if self.can_write() {
+            Ok(())
+        } else {
             Err(Error::msg(
                 "mode is read; refusing a request that writes to R2",
             ))
-        } else {
-            Ok(())
         }
     }
+}
+
+/// Move the process working directory into this app's cache directory and
+/// return the directory the process was launched in.
+///
+/// A long-lived process holds its working directory open, which on Windows
+/// blocks renaming or deleting that tree — an editor that spawns this binary
+/// from its install directory then fails its own update. Anchoring to a
+/// directory this app owns releases whatever the launcher handed us while the
+/// returned launch directory keeps working-directory semantics (an omitted
+/// `cwd`, a relative `--cwd`) intact.
+pub fn release_launch_directory() -> Result<PathBuf> {
+    let launch = std::env::current_dir()?;
+    for anchor in anchor_candidates() {
+        if anchor.is_dir() && std::env::set_current_dir(&anchor).is_ok() {
+            return Ok(launch);
+        }
+    }
+    Err(Error::msg(
+        "cannot move the process working directory to a stable location",
+    ))
+}
+
+fn anchor_candidates() -> Vec<PathBuf> {
+    let mut anchors = Vec::new();
+    if let Ok(cache) = cache_dir() {
+        if fs::create_dir_all(&cache).is_ok() {
+            anchors.push(cache);
+        }
+    }
+    if let Some(home) = user_home_dir() {
+        anchors.push(home);
+    }
+    anchors.push(std::env::temp_dir());
+    anchors
 }
 
 pub fn user_home_dir() -> Option<PathBuf> {

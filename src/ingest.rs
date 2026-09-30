@@ -1,26 +1,23 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
-use crate::catalog::{Catalog, SessionRecord, SCHEMA};
+use crate::catalog::{merge_catalogs, object_key, Catalog, SessionRecord, SCHEMA};
 use crate::config;
 use crate::crypto::Key;
 use crate::document::{encrypt_document, ArchiveDocument};
 use crate::error::{Error, Result};
+use crate::local_state::{LocalStore, RecordState};
 use crate::remote::{commit_catalog, load_catalog};
-use crate::repo_id::{RepoCache, SessionRepo};
 use crate::search_index;
 use crate::sources::{self, Candidate, LoadFailure};
 use crate::store::{Precondition, R2};
 use txcript::HarnessId;
 
-const CURSOR_SCHEMA: u32 = 2;
 const WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// How often ingest runs the orphan sweep and bucket-size report.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -37,79 +34,53 @@ struct Upload {
 struct Scan {
     uploads: Vec<Upload>,
     incoming: Catalog,
-    cursors: CursorSet,
+    local: LocalStore,
     unchanged: usize,
     read: usize,
     missing_cwd: usize,
-    unresolved: Vec<String>,
-    broken: Vec<String>,
-    transient: Vec<String>,
-    generations: BTreeMap<String, String>,
-    changed_dirs: BTreeMap<String, PathBuf>,
-    all_dirs: BTreeMap<String, PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct CursorSet {
-    schema: u32,
-    sessions: BTreeMap<String, StoredCursor>,
-    stores: BTreeMap<String, String>,
-    /// Last orphan sweep. Sweeps are rate-limited so most ingests skip the
-    /// bucket listing entirely.
-    #[serde(default)]
-    last_sweep: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct StoredCursor {
-    fingerprint: String,
-    content_hash: String,
-    session_id: String,
-    cwd: String,
-    state: Keep,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Keep {
-    Archived,
-    Pending,
-    Broken,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Step {
-    Unchanged,
-    Read,
+    failures: Vec<String>,
+    /// Repositories whose sessions changed — their indexes are rebuilt.
+    changed_repos: BTreeSet<String>,
+    /// Every repository a local session belongs to — used to initialize
+    /// repositories that have no snapshot yet.
+    all_repos: BTreeSet<String>,
 }
 
 pub async fn ingest() -> Result<()> {
     let _lock = RunLock::acquire()?;
     let config = config::load_config()?;
     config.require_write()?;
-    let cursors_path = cursors_path()?;
-    let cursors = load_cursors(&cursors_path)?;
     let key = config::load_key()?;
     let r2 = R2::new(&config);
+    let cache_dir = config::cache_dir()?;
     let (catalog, _) = load_catalog(&r2, &key).await?;
-    let scan = tokio::task::spawn_blocking(move || scan(cursors, catalog, key))
+    let local = LocalStore::load(&cache_dir);
+    let scan = tokio::task::spawn_blocking(move || scan(local, catalog, key))
         .await
         .map_err(|error| Error::msg(format!("reading changed sessions: {error}")))??;
-    for upload in &scan.uploads {
+    let Scan {
+        uploads,
+        incoming,
+        mut local,
+        unchanged,
+        read,
+        missing_cwd,
+        failures,
+        changed_repos,
+        all_repos,
+    } = scan;
+    for upload in &uploads {
         r2.put(&upload.object_key, upload.blob.clone(), Precondition::None)
             .await?;
     }
-    let index_key = config::load_key()?;
-    commit_catalog(&r2, &index_key, &scan.incoming).await?;
-    save_cursors(&cursors_path, &scan.cursors)?;
+    commit_catalog(&r2, &key, &incoming).await?;
 
-    if sweep_due(scan.cursors.last_sweep) {
-        match sweep(&r2, &index_key, &config).await {
+    if sweep_due(local.last_sweep()) {
+        match sweep(&r2, &key, &config).await {
             Ok(()) => {
-                let mut cursors = scan.cursors.clone();
-                cursors.last_sweep = Some(Utc::now());
-                if let Err(error) = save_cursors(&cursors_path, &cursors) {
-                    eprintln!("agent-transcript: saving sweep cursor: {error}");
+                local.note_swept();
+                if let Err(error) = local.save_if_dirty() {
+                    eprintln!("agent-transcript: saving local state: {error}");
                 }
             }
             Err(error) => eprintln!("agent-transcript: bucket sweep failed: {error}"),
@@ -119,21 +90,17 @@ pub async fn ingest() -> Result<()> {
     // Rebuild changed repositories and initialize any repository that has no
     // durable search snapshot yet. This is deliberately outside the MCP
     // request path; the next search reads the resulting snapshot directly.
-    let cache_dir = config::cache_dir()?;
-    let mut index_dirs = scan.changed_dirs.clone();
-    for (repo_key, directory) in &scan.all_dirs {
-        if !index_dirs.contains_key(repo_key)
+    let mut index_repos = changed_repos;
+    for repo_key in &all_repos {
+        if !index_repos.contains(repo_key)
             && !search_index::local_path(&cache_dir, repo_key).is_file()
         {
-            index_dirs.insert(repo_key.clone(), directory.clone());
+            index_repos.insert(repo_key.clone());
         }
     }
-    let mut local = crate::local_state::LocalStore::load(&cache_dir);
-    for directory in index_dirs.values() {
-        if let Err(error) = search_index::build_for_directory(
-            &r2, &index_key, &cache_dir, directory, true, &mut local,
-        )
-        .await
+    for repo_key in &index_repos {
+        if let Err(error) =
+            search_index::build_for_repo(&r2, &key, &cache_dir, repo_key, true, &mut local).await
         {
             eprintln!("agent-transcript: search index refresh failed: {error}");
         }
@@ -143,13 +110,17 @@ pub async fn ingest() -> Result<()> {
     }
     println!(
         "uploaded {} session(s), unchanged {}, read {}, missing cwd {}",
-        scan.uploads.len(),
-        scan.unchanged,
-        scan.read,
-        scan.missing_cwd
+        uploads.len(),
+        unchanged,
+        read,
+        missing_cwd
     );
-    if let Some(message) = failure_message(&scan) {
-        return Err(Error::msg(message));
+    if !failures.is_empty() {
+        return Err(Error::msg(format!(
+            "{} source(s) could not be archived this run:\n{}",
+            failures.len(),
+            failures.join("\n")
+        )));
     }
     Ok(())
 }
@@ -262,353 +233,108 @@ fn fmt_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-fn scan(mut cursors: CursorSet, catalog: Catalog, key: Key) -> Result<Scan> {
-    let collected = sources::collect(&cursors.stores)?;
+/// Diff the local source records against the catalog: every `Ready` record
+/// whose content hash is not already archived is re-read, encrypted, and
+/// queued for upload.
+fn scan(mut local: LocalStore, catalog: Catalog, key: Key) -> Result<Scan> {
+    local.diff()?;
+    // The records are the persistent state — they describe the filesystem,
+    // not the upload outcome. A failed commit retries because the catalog
+    // lacks the hash, not because a record forgot the body.
+    local.save_if_dirty()?;
+
     let mut known = catalog_index(&catalog);
-    let mut repos = RepoCache::default();
-    let mut changes = Vec::new();
+    let mut uploads = Vec::new();
+    let mut incoming = Catalog::empty();
     let mut unchanged = 0usize;
-    let mut seen = HashSet::new();
+    let mut failures = local.report.failures.clone();
+    let mut changed_repos = local.report.changed_repos.clone();
 
-    for candidate in collected.candidates {
-        seen.insert(source_key(candidate.harness, &candidate.source));
-        match step_of(&cursors, &known, &mut repos, &candidate)? {
-            Step::Unchanged => unchanged += 1,
-            Step::Read => changes.push(candidate),
+    for record in local.records() {
+        if record.state != RecordState::Ready {
+            continue;
         }
-    }
-    for harness in &collected.quiet {
-        let prefix = format!("{}\n", harness.as_str());
-        let owned: Vec<(String, StoredCursor)> = cursors
-            .sessions
-            .iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
-            .map(|(key, stored)| (key.clone(), stored.clone()))
-            .collect();
-        for (cursor_key, stored) in owned {
-            seen.insert(cursor_key.clone());
-            let source = cursor_key[prefix.len()..].to_string();
-            let candidate = Candidate {
-                harness: *harness,
-                source,
-                fingerprint: stored.fingerprint,
-            };
-            match step_of(&cursors, &known, &mut repos, &candidate)? {
-                Step::Unchanged => unchanged += 1,
-                Step::Read => changes.push(candidate),
-            }
-        }
-    }
-    cursors.sessions.retain(|key, _| {
-        let Some((harness, _)) = split_key(key) else {
-            return false;
+        let Some(repo_key) = record.repo_key.clone() else {
+            continue;
         };
-        if collected.quiet.contains(&harness) {
-            return true;
+        if known.contains(&(
+            record.harness,
+            record.session_id.clone(),
+            record.freshness.content_hash.clone(),
+        )) {
+            unchanged += 1;
+            continue;
         }
-        if collected.generations.contains_key(harness.as_str()) {
-            return seen.contains(key);
-        }
-        true
-    });
-
-    let mut scan = Scan {
-        uploads: Vec::new(),
-        incoming: Catalog::empty(),
-        cursors,
-        unchanged,
-        read: 0,
-        missing_cwd: 0,
-        unresolved: Vec::new(),
-        broken: Vec::new(),
-        transient: Vec::new(),
-        generations: collected.generations,
-        changed_dirs: BTreeMap::new(),
-        all_dirs: BTreeMap::new(),
-    };
-    for candidate in changes {
+        let candidate = Candidate {
+            harness: record.harness,
+            source: record.source.clone(),
+            fingerprint: record.fingerprint.clone(),
+        };
         match sources::load(&candidate) {
-            Ok(loaded) => push_loaded(&mut scan, &key, &mut known, &mut repos, &candidate, loaded)?,
-            Err(LoadFailure::Broken(message)) => {
-                remember_broken(&mut scan, &candidate);
-                scan.broken.push(format!(
-                    "{} {} — {message}",
-                    candidate.harness, candidate.source
-                ));
+            Ok(loaded) => {
+                let session_id = loaded.transcript.meta.id.clone();
+                if session_id.is_empty() {
+                    failures.push(format!(
+                        "{} {} — session id is empty",
+                        record.harness, record.source
+                    ));
+                    continue;
+                }
+                let document =
+                    ArchiveDocument::new(record.harness, repo_key.clone(), loaded.transcript);
+                let hash = document.content_hash()?;
+                if known.contains(&(record.harness, session_id.clone(), hash.clone())) {
+                    // The file moved between the diff and this read, landing
+                    // on a body the catalog already has.
+                    unchanged += 1;
+                    continue;
+                }
+                let object_key = object_key(&hash)?;
+                let blob = encrypt_document(&key, &object_key, &document)?;
+                let revision = document.revision(&hash, loaded.updated_at, blob.len() as u64)?;
+                let piece = Catalog {
+                    schema: SCHEMA,
+                    sessions: vec![SessionRecord {
+                        repo_key: repo_key.clone(),
+                        harness: record.harness,
+                        session_id: session_id.clone(),
+                        revisions: vec![revision],
+                    }],
+                };
+                incoming = merge_catalogs(&incoming, &piece)?;
+                known.insert((record.harness, session_id, hash));
+                uploads.push(Upload { object_key, blob });
+                changed_repos.insert(repo_key);
             }
             Err(LoadFailure::Transient(message)) => {
-                scan.transient.push(format!(
-                    "{} {} — {message}",
-                    candidate.harness, candidate.source
+                failures.push(format!(
+                    "{} {} — transient: {message}",
+                    record.harness, record.source
                 ));
             }
-        }
-    }
-    if scan.transient.is_empty() {
-        scan.cursors.stores.extend(scan.generations.clone());
-    }
-    collect_index_dirs(&mut scan)?;
-    Ok(scan)
-}
-
-fn collect_index_dirs(scan: &mut Scan) -> Result<()> {
-    let mut repos = RepoCache::default();
-    for stored in scan.cursors.sessions.values() {
-        let Some(cwd) = nonempty(&stored.cwd) else {
-            continue;
-        };
-        let path = Path::new(cwd);
-        if !path.is_dir() {
-            continue;
-        }
-        if let SessionRepo::Key(repo_key) = repos.resolve(Some(cwd))? {
-            scan.all_dirs
-                .entry(repo_key)
-                .or_insert_with(|| path.to_path_buf());
-        }
-    }
-    Ok(())
-}
-
-fn step_of(
-    cursors: &CursorSet,
-    known: &HashSet<(HarnessId, String, String)>,
-    repos: &mut RepoCache,
-    candidate: &Candidate,
-) -> Result<Step> {
-    let Some(stored) = cursors
-        .sessions
-        .get(&source_key(candidate.harness, &candidate.source))
-        .cloned()
-    else {
-        return Ok(Step::Read);
-    };
-    let pending_repo = if stored.state == Keep::Pending
-        && !candidate.fingerprint.is_empty()
-        && stored.fingerprint == candidate.fingerprint
-    {
-        Some(repos.resolve(nonempty(&stored.cwd))?)
-    } else {
-        None
-    };
-    let present = catalog_has(known, candidate.harness, &stored);
-    Ok(step(
-        Some(&stored),
-        &candidate.fingerprint,
-        present,
-        pending_repo.as_ref(),
-    ))
-}
-
-fn step(
-    stored: Option<&StoredCursor>,
-    fingerprint: &str,
-    hash_in_catalog: bool,
-    pending_repo: Option<&SessionRepo>,
-) -> Step {
-    let Some(stored) = stored else {
-        return Step::Read;
-    };
-    if fingerprint.is_empty() || stored.fingerprint != fingerprint {
-        return Step::Read;
-    }
-    match stored.state {
-        Keep::Broken => Step::Unchanged,
-        Keep::Archived if hash_in_catalog => Step::Unchanged,
-        Keep::Archived => Step::Read,
-        Keep::Pending => match pending_repo {
-            Some(SessionRepo::Key(_)) => Step::Read,
-            Some(SessionRepo::MissingCwd | SessionRepo::Unresolved(_)) => Step::Unchanged,
-            None => Step::Read,
-        },
-    }
-}
-
-fn catalog_has(
-    known: &HashSet<(HarnessId, String, String)>,
-    harness: HarnessId,
-    stored: &StoredCursor,
-) -> bool {
-    !stored.session_id.is_empty()
-        && !stored.content_hash.is_empty()
-        && known.contains(&(
-            harness,
-            stored.session_id.clone(),
-            stored.content_hash.clone(),
-        ))
-}
-
-fn nonempty(cwd: &str) -> Option<&str> {
-    if cwd.is_empty() {
-        None
-    } else {
-        Some(cwd)
-    }
-}
-
-fn push_loaded(
-    scan: &mut Scan,
-    key: &Key,
-    known: &mut HashSet<(HarnessId, String, String)>,
-    repos: &mut RepoCache,
-    candidate: &Candidate,
-    loaded: sources::Loaded,
-) -> Result<()> {
-    let session_id = loaded.transcript.meta.id.clone();
-    if session_id.is_empty() {
-        remember_broken(scan, candidate);
-        scan.broken.push(format!(
-            "{} {} — session id is empty",
-            candidate.harness, candidate.source
-        ));
-        return Ok(());
-    }
-    let cwd = loaded.transcript.meta.cwd.clone().unwrap_or_default();
-    let updated_at = loaded.updated_at;
-    let harness = candidate.harness;
-    scan.read += 1;
-    match repos.resolve(nonempty(&cwd))? {
-        SessionRepo::MissingCwd => {
-            remember(
-                scan,
-                harness,
-                &session_id,
-                &candidate.fingerprint,
-                &candidate.source,
-                &cwd,
-                "",
-                Keep::Pending,
-            );
-            scan.missing_cwd += 1;
-        }
-        SessionRepo::Unresolved(reason) => {
-            remember(
-                scan,
-                harness,
-                &session_id,
-                &candidate.fingerprint,
-                &candidate.source,
-                &cwd,
-                "",
-                Keep::Pending,
-            );
-            scan.unresolved
-                .push(format!("{harness} {session_id} — {reason}"));
-        }
-        SessionRepo::Key(repo_key) => {
-            if !cwd.is_empty() && Path::new(&cwd).is_dir() {
-                scan.changed_dirs
-                    .insert(repo_key.clone(), PathBuf::from(&cwd));
+            Err(LoadFailure::Broken(message)) => {
+                failures.push(format!("{} {} — {message}", record.harness, record.source));
             }
-            let document = ArchiveDocument::new(harness, repo_key.clone(), loaded.transcript);
-            let hash = document.content_hash()?;
-            if known.contains(&(harness, session_id.clone(), hash.clone())) {
-                remember(
-                    scan,
-                    harness,
-                    &session_id,
-                    &candidate.fingerprint,
-                    &candidate.source,
-                    &cwd,
-                    &hash,
-                    Keep::Archived,
-                );
-                scan.unchanged += 1;
-                return Ok(());
-            }
-            let object_key = crate::catalog::object_key(&hash)?;
-            let blob = encrypt_document(key, &object_key, &document)?;
-            let revision = document.revision(&hash, updated_at, blob.len() as u64)?;
-            let piece = Catalog {
-                schema: SCHEMA,
-                sessions: vec![SessionRecord {
-                    repo_key,
-                    harness,
-                    session_id: session_id.clone(),
-                    revisions: vec![revision],
-                }],
-            };
-            scan.incoming = crate::catalog::merge_catalogs(&scan.incoming, &piece)?;
-            known.insert((harness, session_id.clone(), hash.clone()));
-            scan.uploads.push(Upload { object_key, blob });
-            remember(
-                scan,
-                harness,
-                &session_id,
-                &candidate.fingerprint,
-                &candidate.source,
-                &cwd,
-                &hash,
-                Keep::Archived,
-            );
         }
     }
-    Ok(())
-}
 
-fn remember(
-    scan: &mut Scan,
-    harness: HarnessId,
-    session_id: &str,
-    fingerprint: &str,
-    source: &str,
-    cwd: &str,
-    content_hash: &str,
-    state: Keep,
-) {
-    scan.cursors.sessions.insert(
-        source_key(harness, source),
-        StoredCursor {
-            fingerprint: fingerprint.to_string(),
-            content_hash: content_hash.to_string(),
-            session_id: session_id.to_string(),
-            cwd: cwd.to_string(),
-            state,
-        },
-    );
-}
-
-fn remember_broken(scan: &mut Scan, candidate: &Candidate) {
-    remember(
-        scan,
-        candidate.harness,
-        "",
-        &candidate.fingerprint,
-        &candidate.source,
-        "",
-        "",
-        Keep::Broken,
-    );
-}
-
-fn failure_message(scan: &Scan) -> Option<String> {
-    let mut parts = Vec::new();
-    if !scan.unresolved.is_empty() {
-        parts.push(format!(
-            "origin could not be resolved for {} session(s):\n{}",
-            scan.unresolved.len(),
-            scan.unresolved.join("\n")
-        ));
-    }
-    if !scan.broken.is_empty() {
-        parts.push(format!(
-            "skipped {} unreadable session(s):\n{}",
-            scan.broken.len(),
-            scan.broken.join("\n")
-        ));
-    }
-    if !scan.transient.is_empty() {
-        parts.push(format!(
-            "will retry {} session(s):\n{}",
-            scan.transient.len(),
-            scan.transient.join("\n")
-        ));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
+    let all_repos = local
+        .records()
+        .filter_map(|record| record.repo_key.clone())
+        .collect();
+    let read = local.report.loaded;
+    let missing_cwd = local.report.missing_cwd;
+    Ok(Scan {
+        uploads,
+        incoming,
+        local,
+        unchanged,
+        read,
+        missing_cwd,
+        failures,
+        changed_repos,
+        all_repos,
+    })
 }
 
 fn catalog_index(catalog: &Catalog) -> HashSet<(HarnessId, String, String)> {
@@ -618,71 +344,11 @@ fn catalog_index(catalog: &Catalog) -> HashSet<(HarnessId, String, String)> {
             index.insert((
                 session.harness,
                 session.session_id.clone(),
-                revision.content_hash.clone(),
+                revision.freshness.content_hash.clone(),
             ));
         }
     }
     index
-}
-
-fn split_key(key: &str) -> Option<(HarnessId, &str)> {
-    let (name, source) = key.split_once('\n')?;
-    Some((HarnessId::from_str(name).ok()?, source))
-}
-
-fn source_key(harness: HarnessId, source: &str) -> String {
-    format!("{}\n{source}", harness.as_str())
-}
-
-fn cursors_path() -> Result<PathBuf> {
-    let cache = config::cache_dir()?;
-    let dir = cache
-        .parent()
-        .ok_or_else(|| Error::msg("cannot place the ingest cursor file"))?;
-    Ok(dir.join("cursors.json"))
-}
-
-fn load_cursors(path: &Path) -> Result<CursorSet> {
-    match fs::read_to_string(path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(CursorSet::empty()),
-        Err(error) => Err(error.into()),
-        Ok(text) => {
-            let value: serde_json::Value = serde_json::from_str(&text)?;
-            let Some(schema) = value.get("schema").and_then(serde_json::Value::as_u64) else {
-                return Err(Error::msg("ingest cursor is missing a schema"));
-            };
-            if schema != u64::from(CURSOR_SCHEMA) {
-                let schema = u32::try_from(schema).unwrap_or(u32::MAX);
-                return Err(Error::Schema { schema });
-            }
-            Ok(serde_json::from_value(value)?)
-        }
-    }
-}
-
-fn save_cursors(path: &Path, cursors: &CursorSet) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let text = serde_json::to_vec_pretty(cursors)?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, text)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(&temporary, path)?;
-    Ok(())
-}
-
-impl CursorSet {
-    fn empty() -> Self {
-        Self {
-            schema: CURSOR_SCHEMA,
-            sessions: BTreeMap::new(),
-            stores: BTreeMap::new(),
-            last_sweep: None,
-        }
-    }
 }
 
 struct RunLock {
@@ -691,7 +357,8 @@ struct RunLock {
 
 impl RunLock {
     fn acquire() -> Result<Self> {
-        let path = cursors_path()?.with_file_name("ingest.lock");
+        let path =
+            crate::local_state::state_path(&config::cache_dir()?)?.with_file_name("ingest.lock");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -741,6 +408,15 @@ fn relax_priority() {
         const PRIO_DARWIN_BG: i32 = 0x1000;
         setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG);
     }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        }
+        const PRIO_PROCESS: i32 = 0;
+        // nice +10: the periodic archive pass stays out of interactive work.
+        setpriority(PRIO_PROCESS, 0, 10);
+    }
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -784,65 +460,6 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn stored(fingerprint: &str, hash: &str, state: Keep) -> StoredCursor {
-        StoredCursor {
-            fingerprint: fingerprint.into(),
-            content_hash: hash.into(),
-            session_id: "s1".into(),
-            cwd: r"C:\repo".into(),
-            state,
-        }
-    }
-
-    #[test]
-    fn archived_fingerprint_in_the_catalog_skips_the_body() {
-        let cursor = stored("fp", "hash", Keep::Archived);
-        assert_eq!(step(Some(&cursor), "fp", true, None), Step::Unchanged);
-        assert_eq!(step(Some(&cursor), "fp", false, None), Step::Read);
-        assert_eq!(step(Some(&cursor), "other", true, None), Step::Read);
-    }
-
-    #[test]
-    fn empty_fingerprint_is_read() {
-        let cursor = stored("fp", "hash", Keep::Archived);
-        assert_eq!(step(Some(&cursor), "", true, None), Step::Read);
-        assert_eq!(step(None, "fp", true, None), Step::Read);
-    }
-
-    #[test]
-    fn pending_rereads_only_when_the_repo_resolves() {
-        let cursor = stored("fp", "", Keep::Pending);
-        let unresolved = SessionRepo::Unresolved("cannot resolve origin".into());
-        assert_eq!(
-            step(Some(&cursor), "fp", false, Some(&unresolved)),
-            Step::Unchanged
-        );
-        assert_eq!(
-            step(Some(&cursor), "fp", false, Some(&SessionRepo::MissingCwd)),
-            Step::Unchanged
-        );
-        let resolved = SessionRepo::Key("https://github.com/Org/Repo".into());
-        assert_eq!(
-            step(Some(&cursor), "fp", false, Some(&resolved)),
-            Step::Read
-        );
-    }
-
-    #[test]
-    fn broken_source_is_reread_only_when_its_fingerprint_changes() {
-        let cursor = stored("fp", "", Keep::Broken);
-        assert_eq!(step(Some(&cursor), "fp", false, None), Step::Unchanged);
-        assert_eq!(step(Some(&cursor), "next", false, None), Step::Read);
-    }
-
-    #[test]
-    fn source_key_is_the_harness_and_the_source() {
-        assert_eq!(
-            source_key(HarnessId::Codex, r"C:\sessions\s1"),
-            "codex\nC:\\sessions\\s1"
-        );
-    }
 
     #[test]
     fn orphan_detection_keeps_live_objects_and_index_snapshots() {

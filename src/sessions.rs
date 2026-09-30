@@ -4,11 +4,10 @@ use txcript::{Common, HarnessId, Transcript};
 
 use crate::catalog::Catalog;
 use crate::crypto::Key;
-use crate::document::ArchiveDocument;
 use crate::error::{Error, Result};
 use crate::local_state::{LocalStore, SourceRecord};
 use crate::merge::{
-    choose_current, select, Current, Freshness, LocalView, MergedView, Pick, RemoteView,
+    choose_current, prefer, select, Current, LocalView, MergedView, Pick, Preference, RemoteView,
 };
 use crate::remote::{document_from_plaintext, load_plaintext};
 use crate::sources::{self, Candidate, LoadFailure};
@@ -16,9 +15,9 @@ use crate::store::R2;
 
 /// Local session views grouped and deduplicated from the persistent records.
 ///
-/// Bodies are only read here to break exact metadata ties between two
-/// records of the same session (mirrors the previous `fill()` behavior);
-/// everything else is answered from the stored record metadata.
+/// The records already carry freshness (timestamps, message count, content
+/// hash), so ties are ranked by the same `prefer` the remote merge uses —
+/// no body is read here.
 pub fn local_views(store: &LocalStore) -> Result<Vec<LocalView>> {
     store
         .grouped()
@@ -100,88 +99,26 @@ fn view_of(record: &SourceRecord) -> LocalView {
         repo_key: record.repo_key.clone(),
         source: record.source.clone(),
         fingerprint: record.fingerprint.clone(),
-        freshness: Freshness {
-            updated_at: record.updated_at,
-            last_message_at: record.last_message_at,
-            message_count: record.message_count,
-            content_hash: record.content_hash.clone(),
-        },
-        started_at: record.started_at,
-        title: record.title.clone(),
-        cwd: record.cwd.clone(),
-        git_branch: record.git_branch.clone(),
-        model: record.model.clone(),
+        freshness: record.freshness.clone(),
+        info: record.info.clone(),
     }
 }
 
 fn choose_local(mut group: Vec<LocalView>) -> Result<LocalView> {
-    if group.len() == 1 || group[0].repo_key.is_none() {
-        return Ok(group
-            .into_iter()
-            .max_by_key(|view| view.freshness.updated_at)
-            .expect("group is non-empty"));
-    }
-    let dated = group.iter().all(|view| view.freshness.updated_at.is_some());
-    let first = group[0].freshness.updated_at;
-    if dated && group.iter().any(|view| view.freshness.updated_at != first) {
-        return Ok(group
-            .into_iter()
-            .max_by_key(|view| view.freshness.updated_at)
-            .expect("group is non-empty"));
-    }
-    for view in &mut group {
-        fill(view)?;
-    }
     let mut best = group.remove(0);
     for other in group {
-        match crate::merge::prefer(&best.freshness, &other.freshness) {
-            Ok(crate::merge::Side::Local) => {}
-            Ok(crate::merge::Side::Remote) => best = other,
-            Err(_) => {
+        match prefer(&best.freshness, &other.freshness) {
+            Preference::Local => {}
+            Preference::Remote => best = other,
+            Preference::Ambiguous => {
                 return Err(Error::Ambiguous {
                     harness: best.harness.to_string(),
-                    session_id: best.session_id,
+                    session_id: best.session_id.clone(),
                 })
             }
         }
     }
     Ok(best)
-}
-
-/// Tie resolution: read the body once to rank two equally dated records of
-/// the same session.
-fn fill(view: &mut LocalView) -> Result<()> {
-    let repo_key = view
-        .repo_key
-        .clone()
-        .ok_or_else(|| Error::msg("cannot hash a session with no repo key"))?;
-    let candidate = Candidate {
-        harness: view.harness,
-        source: view.source.clone(),
-        fingerprint: view.fingerprint.clone(),
-    };
-    let transcript = sources::load(&candidate)
-        .map(|loaded| loaded.transcript)
-        .map_err(|failure| {
-            Error::msg(format!(
-                "reading {} {}: {}",
-                view.harness,
-                view.session_id,
-                match failure {
-                    LoadFailure::Transient(message) | LoadFailure::Broken(message) => message,
-                }
-            ))
-        })?;
-    let document = ArchiveDocument::new(view.harness, repo_key, transcript);
-    view.freshness.last_message_at = document.messages.last().map(|message| message.timestamp);
-    view.freshness.message_count = document.messages.len() as u64;
-    view.freshness.content_hash = document.content_hash()?;
-    view.title = document.meta.title.clone();
-    view.cwd = document.meta.cwd.clone();
-    view.git_branch = document.meta.git_branch.clone();
-    view.model = document.meta.model.clone();
-    view.started_at = document.meta.timestamp;
-    Ok(())
 }
 
 fn load_error(view: &MergedView, failure: LoadFailure) -> Error {
@@ -206,12 +143,7 @@ fn remote_views(catalog: &Catalog) -> Result<Vec<RemoteView>> {
         let ranked = session
             .revisions
             .iter()
-            .map(|revision| Freshness {
-                updated_at: revision.updated_at,
-                last_message_at: revision.last_message_at,
-                message_count: revision.message_count,
-                content_hash: revision.content_hash.clone(),
-            })
+            .map(|revision| revision.freshness.clone())
             .collect::<Vec<_>>();
         let (index, ambiguous) = match choose_current(&ranked)? {
             Current::Index(index) => (index, false),
@@ -222,13 +154,9 @@ fn remote_views(catalog: &Catalog) -> Result<Vec<RemoteView>> {
             harness: session.harness,
             session_id: session.session_id.clone(),
             repo_key: session.repo_key.clone(),
-            freshness: ranked[index].clone(),
+            freshness: current.freshness.clone(),
             object_key: current.object_key.clone(),
-            started_at: current.started_at,
-            title: current.title.clone(),
-            cwd: current.cwd.clone(),
-            git_branch: current.git_branch.clone(),
-            model: current.model.clone(),
+            info: current.info.clone(),
             ambiguous,
         });
     }
@@ -273,7 +201,7 @@ fn unique_match<'a>(merged: &'a [MergedView], src: &str) -> Result<Option<&'a Me
     }
     let titles: Vec<_> = merged
         .iter()
-        .filter(|session| session.title.as_deref() == Some(src))
+        .filter(|session| session.info.title.as_deref() == Some(src))
         .collect();
     if titles.len() > 1 {
         return Err(Error::msg(format!("title `{src}` is ambiguous")));

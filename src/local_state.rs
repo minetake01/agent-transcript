@@ -1,17 +1,18 @@
-//! Persistent per-source session records for the MCP request path.
+//! Persistent per-source session records — the single source of truth for
+//! what the local stores contain.
 //!
-//! `local::discover()` reads every session file — Claude Code alone parses
-//! each `.jsonl` in full — which made every MCP call take seconds. This
-//! module keeps one record per session source (metadata, freshness, and a
-//! stat fingerprint) in a small JSON file. Each call performs a stat-only
-//! scan; a source's body is only read when it is new or its fingerprint
-//! moved, so steady-state calls do no transcript I/O at all.
+//! `store.discover()` reads every session file — Claude Code alone parses
+//! each `.jsonl` in full — which made every scan take seconds. This module
+//! keeps one record per session source (metadata, freshness, and a stat
+//! fingerprint) in a small JSON file. A diff performs a stat-only walk of
+//! every store location in `sources::sites()`; a source's body is only read
+//! when it is new or its fingerprint moved, so steady-state diffs do no
+//! transcript I/O at all.
 //!
-//! Single-file stores (Claude Code, Codex, Pi, Campfire, Cursor, Amp,
-//! Antigravity, Cowork) are enumerated straight from the file listing —
-//! `store.discover()` is never needed. Directory-based sessions (Grok, fx,
-//! Grok Bot) are detected by marker files inside their session directory.
-//! Database-backed stores (Hermes, Cursor Desktop, OpenCode) reuse
+//! Both consumers read these records: ingest uploads a revision for every
+//! `Ready` record whose content hash is absent from the catalog, and the MCP
+//! request path lists them merged with the remote archive. Database-backed
+//! stores (Hermes, Cursor Desktop, OpenCode) reuse
 //! `sources::discover_db_candidates` but only when the database file itself
 //! changed.
 
@@ -21,16 +22,13 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use txcript::harness::{
-    amp, campfire, claude_code, codex, cowork, cursor, cursor_desktop, fx, grok, grok_bot, hermes,
-    opencode, pi,
-};
 use txcript::HarnessId;
 
 use crate::document::ArchiveDocument;
 use crate::error::{Error, Result};
+use crate::merge::{Freshness, Info};
 use crate::repo_id::{self, SessionRepo};
-use crate::sources::{self, Candidate, LoadFailure, TreeRow};
+use crate::sources::{self, Candidate, Kind, LoadFailure, Site};
 
 const STATE_SCHEMA: u32 = 1;
 const STATE_FILE: &str = "local-state.json";
@@ -57,15 +55,10 @@ pub struct SourceRecord {
     pub session_id: String,
     pub repo_key: Option<String>,
     pub state: RecordState,
-    pub started_at: DateTime<Utc>,
-    pub updated_at: Option<DateTime<Utc>>,
-    pub last_message_at: Option<DateTime<Utc>>,
-    pub message_count: u64,
-    pub content_hash: String,
-    pub title: Option<String>,
-    pub cwd: Option<String>,
-    pub git_branch: Option<String>,
-    pub model: Option<String>,
+    #[serde(flatten)]
+    pub freshness: Freshness,
+    #[serde(flatten)]
+    pub info: Info,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +80,10 @@ struct State {
     /// Per-harness database fingerprints for database-backed stores.
     #[serde(default)]
     db_fingerprints: BTreeMap<String, String>,
+    /// Last orphan sweep. Sweeps are rate-limited so most ingests skip the
+    /// bucket listing entirely.
+    #[serde(default)]
+    last_sweep: Option<DateTime<Utc>>,
 }
 
 impl State {
@@ -96,6 +93,7 @@ impl State {
             sources: BTreeMap::new(),
             repos: BTreeMap::new(),
             db_fingerprints: BTreeMap::new(),
+            last_sweep: None,
         }
     }
 }
@@ -103,10 +101,21 @@ impl State {
 /// What the last [`LocalStore::diff`] did.
 #[derive(Debug, Default)]
 pub struct Report {
+    /// Bodies read this diff.
     pub loaded: usize,
+    /// Records dropped because their source vanished.
     pub removed: usize,
+    /// Loads that failed permanently this diff.
     pub broken: usize,
+    /// Loads that failed transiently this diff.
     pub transient: usize,
+    /// Freshly read sessions whose transcript records no usable cwd.
+    pub missing_cwd: usize,
+    /// Repositories whose sessions were added, changed, or removed this
+    /// diff — the set ingest rebuilds search indexes for.
+    pub changed_repos: BTreeSet<String>,
+    /// Per-source failure details from this diff (`harness source — reason`).
+    pub failures: Vec<String>,
 }
 
 pub struct LocalStore {
@@ -136,6 +145,9 @@ impl LocalStore {
             },
             Err(_) => State::empty(),
         };
+        // State files from earlier layouts.
+        let _ = fs::remove_file(path.with_file_name("cursors.json"));
+        let _ = fs::remove_dir_all(cache_dir.join("search"));
         Self {
             path,
             state,
@@ -149,149 +161,128 @@ impl LocalStore {
         if !self.dirty {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(&self.state)?)?;
-        if self.path.exists() {
-            fs::remove_file(&self.path)?;
-        }
-        fs::rename(&temporary, &self.path)?;
+        crate::fsutil::atomic_write(&self.path, &serde_json::to_vec_pretty(&self.state)?)?;
         self.dirty = false;
         Ok(())
+    }
+
+    /// When the last orphan sweep ran — ingest rate-limits bucket listings.
+    pub fn last_sweep(&self) -> Option<DateTime<Utc>> {
+        self.state.last_sweep
+    }
+
+    /// Record a completed sweep.
+    pub fn note_swept(&mut self) {
+        self.state.last_sweep = Some(Utc::now());
+        self.dirty = true;
     }
 
     pub fn records(&self) -> impl Iterator<Item = &SourceRecord> {
         self.state.sources.values()
     }
 
-    /// Stat-only scan of every store. Bodies are read only for new or
-    /// changed sources.
+    /// Stat-only scan of every site in `sources::sites()`. Bodies are read
+    /// only for new or changed sources.
     pub fn diff(&mut self) -> Result<()> {
         self.report = Report::default();
-        for probe in probes() {
-            match probe {
-                Probe::Files {
-                    harness,
-                    root,
-                    rule,
-                } => {
-                    self.scan_files(harness, &root, rule);
-                }
-                Probe::SessionDirs {
-                    harness,
-                    root,
-                    markers,
-                } => {
-                    self.scan_session_dirs(harness, &root, markers, false);
-                }
-                Probe::GrokBot { root, agents } => {
-                    for root in [root, agents].into_iter().flatten() {
-                        self.scan_session_dirs(HarnessId::GrokBot, &root, &[], true);
-                    }
-                }
-                Probe::Db { harness, db } => {
-                    if let Err(error) = self.scan_db(harness, &db) {
+        for site in sources::sites() {
+            match &site.kind {
+                Kind::Files { .. } => self.scan_files(&site),
+                Kind::SessionDirs { .. } | Kind::GrokBotDirs => self.scan_session_dirs(&site),
+                Kind::Db => {
+                    if let Err(error) = self.scan_db(&site) {
                         // A broken database store must not take down every
                         // query; its existing records stay until it recovers.
-                        eprintln!("agent-transcript: {harness} discovery failed: {error}");
+                        eprintln!(
+                            "agent-transcript: {} discovery failed: {error}",
+                            site.harness
+                        );
                     }
                 }
             }
         }
         // Sources whose stores disappeared entirely: drop their records for
-        // any harness that no probe covers anymore.
+        // any harness that no site covers anymore.
         self.drop_orphan_harnesses();
         self.resolve_pending();
         Ok(())
     }
 
-    fn scan_files(&mut self, harness: HarnessId, root: &Path, rule: FileRule) {
-        let rows = sources::walk_tree(root);
+    fn scan_files(&mut self, site: &Site) {
+        let rows = sources::walk_tree(&site.path);
         let mut seen = HashSet::new();
-        let root_str = root.to_string_lossy().into_owned();
+        let root_str = site.path.to_string_lossy().into_owned();
         for (index, row) in rows.iter().enumerate() {
-            if !rule.matches(&row.rel) {
+            if !site.kind.matches_file(&row.rel) {
                 continue;
             }
-            let source = root.join(&row.rel).to_string_lossy().into_owned();
-            let fingerprint = file_fingerprint(index, &rows, rule);
-            let updated = DateTime::<Utc>::from(
-                std::time::UNIX_EPOCH + std::time::Duration::from_nanos(row.mtime_ns as u64),
-            );
-            seen.insert(source_key(harness, &source));
-            self.reconsider(harness, &source, fingerprint, Some(updated));
+            let source = sources::join_rel(&site.path, &row.rel)
+                .to_string_lossy()
+                .into_owned();
+            let fingerprint = sources::row_fingerprint(index, &rows, site);
+            let updated = sources::mtime_datetime(row.mtime_ns);
+            seen.insert(source_key(site.harness, &source));
+            self.reconsider(site.harness, &source, fingerprint, Some(updated));
         }
-        self.drop_unseen(harness, Some(&root_str), &seen);
+        self.drop_unseen(site.harness, Some(&root_str), &seen);
     }
 
-    fn scan_session_dirs(
-        &mut self,
-        harness: HarnessId,
-        root: &Path,
-        markers: &[&str],
-        grok_bot_rules: bool,
-    ) {
-        let rows = sources::walk_tree(root);
+    fn scan_session_dirs(&mut self, site: &Site) {
+        let rows = sources::walk_tree(&site.path);
         let mut dirs = BTreeSet::new();
         for row in &rows {
             let Some((parent, name)) = row.rel.rsplit_once('/') else {
                 continue;
             };
-            let parent_name = parent.rsplit('/').next().unwrap_or(parent);
-            let is_marker = markers.contains(&name)
-                || (grok_bot_rules
-                    && (name == "profile.json"
-                        || name
-                            .strip_suffix(".jsonl")
-                            .is_some_and(|stem| stem == parent_name)));
-            if is_marker {
+            if site.kind.is_dir_marker(parent, name) {
                 dirs.insert(parent.to_string());
             }
         }
         let mut seen = HashSet::new();
-        let root_str = root.to_string_lossy().into_owned();
+        let root_str = site.path.to_string_lossy().into_owned();
         for dir in dirs {
             let prefix = format!("{dir}/");
-            let members: Vec<&TreeRow> = rows
+            let members: Vec<&sources::TreeRow> = rows
                 .iter()
                 .filter(|row| row.rel.starts_with(&prefix))
                 .collect();
             let fingerprint = sources::dir_fingerprint(members.iter().copied());
-            let updated = members.iter().map(|row| row.mtime_ns).max().map(|ns| {
-                DateTime::<Utc>::from(
-                    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ns as u64),
-                )
-            });
-            let source = root.join(&dir).to_string_lossy().into_owned();
-            seen.insert(source_key(harness, &source));
-            self.reconsider(harness, &source, fingerprint, updated);
+            let updated = members
+                .iter()
+                .map(|row| row.mtime_ns)
+                .max()
+                .map(sources::mtime_datetime);
+            let source = sources::join_rel(&site.path, &dir)
+                .to_string_lossy()
+                .into_owned();
+            seen.insert(source_key(site.harness, &source));
+            self.reconsider(site.harness, &source, fingerprint, updated);
         }
-        self.drop_unseen(harness, Some(&root_str), &seen);
+        self.drop_unseen(site.harness, Some(&root_str), &seen);
     }
 
-    fn scan_db(&mut self, harness: HarnessId, db: &Path) -> Result<()> {
-        let fingerprint = sources::db_fingerprint(db);
-        if self.state.db_fingerprints.get(harness.as_str()) == Some(&fingerprint) {
+    fn scan_db(&mut self, site: &Site) -> Result<()> {
+        let fingerprint = sources::db_fingerprint(&site.path);
+        if self.state.db_fingerprints.get(site.harness.as_str()) == Some(&fingerprint) {
             return Ok(());
         }
-        let candidates = sources::discover_db_candidates(harness)?;
+        let candidates = sources::discover_db_candidates(site.harness)?;
         let mut seen = HashSet::new();
         for candidate in candidates {
-            seen.insert(source_key(harness, &candidate.source));
-            self.reconsider(harness, &candidate.source, candidate.fingerprint, None);
+            seen.insert(source_key(site.harness, &candidate.source));
+            self.reconsider(site.harness, &candidate.source, candidate.fingerprint, None);
         }
-        self.drop_unseen(harness, None, &seen);
+        self.drop_unseen(site.harness, None, &seen);
         self.state
             .db_fingerprints
-            .insert(harness.as_str().to_string(), fingerprint);
+            .insert(site.harness.as_str().to_string(), fingerprint);
         self.dirty = true;
         Ok(())
     }
 
-    /// Load or reload one source. Called for new files, changed
-    /// fingerprints, and pending records whose repository became resolvable.
+    /// Load or reload one source. Called for new sources and changed
+    /// fingerprints; same-fingerprint records are left alone (pending
+    /// retries are `resolve_pending`'s job).
     fn reconsider(
         &mut self,
         harness: HarnessId,
@@ -300,16 +291,13 @@ impl LocalStore {
         updated_at: Option<DateTime<Utc>>,
     ) {
         let key = source_key(harness, source);
-        if let Some(record) = self.state.sources.get(&key) {
-            if record.fingerprint == fingerprint && record.state != RecordState::Pending {
-                return;
-            }
-            if record.fingerprint == fingerprint && record.state == RecordState::Pending {
-                // Same body; only the repo resolution may have improved.
-                if record.repo_key.is_some() || !self.cwd_resolves(record.cwd.as_deref()) {
-                    return;
-                }
-            }
+        if self
+            .state
+            .sources
+            .get(&key)
+            .is_some_and(|record| record.fingerprint == fingerprint)
+        {
+            return;
         }
         self.reload(harness, source, fingerprint, updated_at);
     }
@@ -322,6 +310,11 @@ impl LocalStore {
         updated_at: Option<DateTime<Utc>>,
     ) {
         let key = source_key(harness, source);
+        // Failure details are reported once per body: a pending record that
+        // stays pending across retries does not re-report.
+        let already_pending = self.state.sources.get(&key).is_some_and(|record| {
+            record.state == RecordState::Pending && record.fingerprint == fingerprint
+        });
         let candidate = Candidate {
             harness,
             source: source.to_string(),
@@ -335,12 +328,22 @@ impl LocalStore {
                 let session_id = transcript.meta.id.clone();
                 let cwd = transcript.meta.cwd.clone();
                 let started_at = transcript.meta.timestamp;
-                let last_message_at = transcript.body.last().map(|message| message.timestamp);
-                let message_count = transcript.body.len() as u64;
-                let title = transcript.meta.title.clone();
-                let git_branch = transcript.meta.git_branch.clone();
-                let model = transcript.meta.model.clone();
-                let (repo_key, content_hash, mut state) = match self.resolve_repo(cwd.as_deref()) {
+                let freshness_meta = Freshness {
+                    updated_at: updated_at.or(loaded.updated_at),
+                    last_message_at: transcript.body.last().map(|message| message.timestamp),
+                    message_count: transcript.body.len() as u64,
+                    content_hash: String::new(),
+                };
+                let info = Info {
+                    started_at,
+                    title: transcript.meta.title.clone(),
+                    cwd,
+                    git_branch: transcript.meta.git_branch.clone(),
+                    model: transcript.meta.model.clone(),
+                };
+                let (repo_key, content_hash, mut state) = match self
+                    .resolve_repo(info.cwd.as_deref())
+                {
                     SessionRepo::Key(repo_key) => {
                         let document = ArchiveDocument::new(harness, repo_key.clone(), transcript);
                         (
@@ -349,13 +352,36 @@ impl LocalStore {
                             RecordState::Ready,
                         )
                     }
-                    SessionRepo::MissingCwd | SessionRepo::Unresolved(_) => {
+                    SessionRepo::MissingCwd => {
+                        if !already_pending {
+                            self.report.missing_cwd += 1;
+                        }
+                        (None, String::new(), RecordState::Pending)
+                    }
+                    SessionRepo::Unresolved(reason) => {
+                        if !already_pending {
+                            self.report.failures.push(format!(
+                                "{harness} {source} — cannot resolve origin: {reason}"
+                            ));
+                        }
                         (None, String::new(), RecordState::Pending)
                     }
                 };
                 if session_id.is_empty() {
                     state = RecordState::Broken;
                     self.report.broken += 1;
+                    self.report
+                        .failures
+                        .push(format!("{harness} {source} — session id is empty"));
+                }
+                let freshness = Freshness {
+                    content_hash,
+                    ..freshness_meta
+                };
+                if state == RecordState::Ready {
+                    if let Some(repo_key) = &repo_key {
+                        self.report.changed_repos.insert(repo_key.clone());
+                    }
                 }
                 let record = SourceRecord {
                     harness,
@@ -364,26 +390,22 @@ impl LocalStore {
                     session_id,
                     repo_key,
                     state,
-                    started_at,
-                    updated_at: updated_at.or(loaded.updated_at),
-                    last_message_at,
-                    message_count,
-                    content_hash,
-                    title,
-                    cwd,
-                    git_branch,
-                    model,
+                    freshness,
+                    info,
                 };
                 self.state.sources.insert(key, record);
                 self.report.loaded += 1;
                 self.dirty = true;
             }
-            Err(LoadFailure::Transient(_)) => {
+            Err(LoadFailure::Transient(message)) => {
                 // Keep the previous record — the file is probably locked or
                 // half-written; the next diff retries it.
                 self.report.transient += 1;
+                self.report
+                    .failures
+                    .push(format!("{harness} {source} — transient: {message}"));
             }
-            Err(LoadFailure::Broken(_)) => {
+            Err(LoadFailure::Broken(message)) => {
                 self.state.sources.insert(
                     key,
                     SourceRecord {
@@ -393,18 +415,25 @@ impl LocalStore {
                         session_id: String::new(),
                         repo_key: None,
                         state: RecordState::Broken,
-                        started_at: Utc::now(),
-                        updated_at,
-                        last_message_at: None,
-                        message_count: 0,
-                        content_hash: String::new(),
-                        title: None,
-                        cwd: None,
-                        git_branch: None,
-                        model: None,
+                        freshness: Freshness {
+                            updated_at,
+                            last_message_at: None,
+                            message_count: 0,
+                            content_hash: String::new(),
+                        },
+                        info: Info {
+                            started_at: Utc::now(),
+                            title: None,
+                            cwd: None,
+                            git_branch: None,
+                            model: None,
+                        },
                     },
                 );
                 self.report.broken += 1;
+                self.report
+                    .failures
+                    .push(format!("{harness} {source} — {message}"));
                 self.dirty = true;
             }
         }
@@ -445,20 +474,12 @@ impl LocalStore {
         resolved
     }
 
-    fn cwd_resolves(&self, cwd: Option<&str>) -> bool {
-        cwd.is_some_and(|cwd| {
-            self.state
-                .repos
-                .get(cwd)
-                .is_some_and(|entry| entry.repo_key.is_some())
-        })
-    }
-
-    /// Records whose source vanished under this probe's root are gone.
+    /// Records whose source vanished under this site's root are gone.
     fn drop_unseen(&mut self, harness: HarnessId, root: Option<&str>, seen: &HashSet<String>) {
         let prefix = format!("{}\n", harness.as_str());
+        let mut removed_repos = Vec::new();
         let before = self.state.sources.len();
-        self.state.sources.retain(|key, _| {
+        self.state.sources.retain(|key, record| {
             let Some(rest) = key.strip_prefix(&prefix) else {
                 return true;
             };
@@ -467,11 +488,18 @@ impl LocalStore {
                     return true;
                 }
             }
-            seen.contains(key)
+            if seen.contains(key) {
+                return true;
+            }
+            if let Some(repo_key) = &record.repo_key {
+                removed_repos.push(repo_key.clone());
+            }
+            false
         });
         let removed = before - self.state.sources.len();
         if removed > 0 {
             self.report.removed += removed;
+            self.report.changed_repos.extend(removed_repos);
             self.dirty = true;
         }
     }
@@ -480,236 +508,61 @@ impl LocalStore {
     /// records are dropped on the next diff — sessions are files, so a
     /// missing store means missing sessions.
     fn drop_orphan_harnesses(&mut self) {
-        let covered: HashSet<String> = probes()
+        let covered: HashSet<String> = sources::sites()
             .iter()
-            .map(|probe| probe.harness().as_str().to_string())
+            .map(|site| site.harness.as_str().to_string())
             .collect();
+        let mut removed_repos = Vec::new();
         let before = self.state.sources.len();
-        self.state.sources.retain(|key, _| {
+        self.state.sources.retain(|key, record| {
             let Some((harness, _)) = key.split_once('\n') else {
                 return false;
             };
-            covered.contains(harness)
+            if covered.contains(harness) {
+                return true;
+            }
+            if let Some(repo_key) = &record.repo_key {
+                removed_repos.push(repo_key.clone());
+            }
+            false
         });
         let removed = before - self.state.sources.len();
         if removed > 0 {
             self.report.removed += removed;
+            self.report.changed_repos.extend(removed_repos);
             self.dirty = true;
         }
     }
 
     /// Pending records whose cwd now resolves get one body reload to compute
-    /// their content hash.
+    /// their content hash. Cached failures are retried by `resolve_repo`'s
+    /// own staleness bound.
     fn resolve_pending(&mut self) {
-        let pending: Vec<(HarnessId, String, String, Option<DateTime<Utc>>)> = self
+        let pending: Vec<String> = self
             .state
             .sources
-            .values()
-            .filter_map(|record| {
-                if record.state != RecordState::Pending || record.repo_key.is_some() {
-                    return None;
-                }
-                self.cwd_resolves(record.cwd.as_deref()).then(|| {
-                    (
-                        record.harness,
-                        record.source.clone(),
-                        record.fingerprint.clone(),
-                        record.updated_at,
-                    )
-                })
-            })
+            .iter()
+            .filter(|(_, record)| record.state == RecordState::Pending)
+            .map(|(key, _)| key.clone())
             .collect();
-        for (harness, source, fingerprint, updated_at) in pending {
-            self.reload(harness, &source, fingerprint, updated_at);
+        for key in pending {
+            let Some(record) = self.state.sources.get(&key) else {
+                continue;
+            };
+            let harness = record.harness;
+            let source = record.source.clone();
+            let fingerprint = record.fingerprint.clone();
+            let updated_at = record.freshness.updated_at;
+            let cwd = record.info.cwd.clone();
+            if matches!(self.resolve_repo(cwd.as_deref()), SessionRepo::Key(_)) {
+                self.reload(harness, &source, fingerprint, updated_at);
+            }
         }
     }
 }
 
 fn source_key(harness: HarnessId, source: &str) -> String {
     format!("{}\n{source}", harness.as_str())
-}
-
-/// Which local files identify a session source for a file-backed store.
-#[derive(Clone, Copy)]
-enum FileRule {
-    /// Any file with this extension is a candidate session.
-    Ext(&'static str),
-    /// `local_*.json` records; the same-stem directory (audit log, project
-    /// transcript) belongs to the same session and joins the fingerprint.
-    CoworkRecord,
-}
-
-impl FileRule {
-    fn matches(&self, rel: &str) -> bool {
-        let name = rel.rsplit('/').next().unwrap_or(rel);
-        match self {
-            Self::Ext(ext) => name
-                .rsplit_once('.')
-                .is_some_and(|(_, suffix)| suffix == *ext),
-            Self::CoworkRecord => name.starts_with("local_") && name.ends_with(".json"),
-        }
-    }
-
-    fn db_sidecars(&self) -> bool {
-        matches!(self, Self::Ext("db"))
-    }
-
-    fn extent_dir(&self) -> bool {
-        matches!(self, Self::CoworkRecord)
-    }
-}
-
-/// Fingerprint of one session source within a walked tree.
-fn file_fingerprint(index: usize, rows: &[TreeRow], rule: FileRule) -> String {
-    let row = &rows[index];
-    let mut fingerprint = format!("{}:{}", row.mtime_ns, row.size);
-    if rule.db_sidecars() {
-        for suffix in ["-wal", "-shm"] {
-            let want = format!("{}{suffix}", row.rel);
-            if let Some(sidecar) = rows.iter().find(|row| row.rel == want) {
-                fingerprint.push_str(&format!("|{}:{}", sidecar.mtime_ns, sidecar.size));
-            }
-        }
-    }
-    if rule.extent_dir() {
-        let dir = row.rel.strip_suffix(".json").unwrap_or(&row.rel);
-        let prefix = format!("{dir}/");
-        let hash =
-            sources::dir_fingerprint(rows.iter().filter(|member| member.rel.starts_with(&prefix)));
-        fingerprint.push_str(&format!("|{hash}"));
-    }
-    fingerprint
-}
-
-enum Probe {
-    Files {
-        harness: HarnessId,
-        root: PathBuf,
-        rule: FileRule,
-    },
-    SessionDirs {
-        harness: HarnessId,
-        root: PathBuf,
-        markers: &'static [&'static str],
-    },
-    GrokBot {
-        root: Option<PathBuf>,
-        agents: Option<PathBuf>,
-    },
-    Db {
-        harness: HarnessId,
-        db: PathBuf,
-    },
-}
-
-impl Probe {
-    fn harness(&self) -> HarnessId {
-        match self {
-            Self::Files { harness, .. }
-            | Self::SessionDirs { harness, .. }
-            | Self::Db { harness, .. } => *harness,
-            Self::GrokBot { .. } => HarnessId::GrokBot,
-        }
-    }
-}
-
-fn probes() -> Vec<Probe> {
-    let mut probes = Vec::new();
-    if let Some(store) = claude_code::ClaudeStore::default_root() {
-        probes.push(Probe::Files {
-            harness: HarnessId::ClaudeCode,
-            root: store.root,
-            rule: FileRule::Ext("jsonl"),
-        });
-    }
-    if let Some(store) = codex::CodexStore::default_root() {
-        probes.push(Probe::Files {
-            harness: HarnessId::Codex,
-            root: store.sessions_dir,
-            rule: FileRule::Ext("jsonl"),
-        });
-    }
-    if let Some(store) = pi::PiStore::default_root() {
-        probes.push(Probe::Files {
-            harness: HarnessId::Pi,
-            root: store.sessions_dir,
-            rule: FileRule::Ext("jsonl"),
-        });
-    }
-    if let Some(store) = campfire::CampfireStore::default_root() {
-        probes.push(Probe::Files {
-            harness: HarnessId::Campfire,
-            root: store.sessions_dir,
-            rule: FileRule::Ext("jsonl"),
-        });
-    }
-    if let Some(store) = cursor::CursorStore::default_root() {
-        probes.push(Probe::Files {
-            harness: HarnessId::Cursor,
-            root: store.chats_dir,
-            rule: FileRule::Ext("db"),
-        });
-    }
-    if let Some(store) = amp::AmpStore::default_root() {
-        probes.push(Probe::Files {
-            harness: HarnessId::Amp,
-            root: store.threads_dir,
-            rule: FileRule::Ext("json"),
-        });
-    }
-    for store in sources::antigravity_stores() {
-        probes.push(Probe::Files {
-            harness: HarnessId::Antigravity,
-            root: store.root.join("conversations"),
-            rule: FileRule::Ext("db"),
-        });
-    }
-    if let Some(store) = cowork::CoworkStore::default_root() {
-        probes.push(Probe::Files {
-            harness: HarnessId::Cowork,
-            root: store.root,
-            rule: FileRule::CoworkRecord,
-        });
-    }
-    if let Some(store) = grok::GrokStore::default_root() {
-        probes.push(Probe::SessionDirs {
-            harness: HarnessId::Grok,
-            root: store.sessions_dir,
-            markers: &["updates.jsonl", "chat_history.jsonl"],
-        });
-    }
-    if let Some(store) = grok_bot::GrokBotStore::default_root() {
-        probes.push(Probe::GrokBot {
-            root: Some(store.root),
-            agents: store.agents,
-        });
-    }
-    if let Some(store) = fx::FxStore::default_root() {
-        probes.push(Probe::SessionDirs {
-            harness: HarnessId::Fx,
-            root: store.sessions_dir,
-            markers: &["events.jsonl"],
-        });
-    }
-    if let Some(store) = hermes::HermesStore::default_root() {
-        probes.push(Probe::Db {
-            harness: HarnessId::Hermes,
-            db: store.db_path,
-        });
-    }
-    if let Some(store) = cursor_desktop::CursorDesktopStore::default_root() {
-        probes.push(Probe::Db {
-            harness: HarnessId::CursorDesktop,
-            db: store.user_dir.join("globalStorage").join("state.vscdb"),
-        });
-    }
-    if let Some(store) = opencode::OpenCodeStore::default_db() {
-        probes.push(Probe::Db {
-            harness: HarnessId::OpenCode,
-            db: store.db_path,
-        });
-    }
-    probes
 }
 
 /// Grouped session records ready for merge ranking — a lookup for
@@ -738,6 +591,7 @@ impl LocalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::FileRule;
 
     #[test]
     fn file_rule_matches_extensions_and_cowork_records() {
@@ -747,58 +601,6 @@ mod tests {
         assert!(FileRule::Ext("db").matches("chat/store.db"));
         assert!(FileRule::CoworkRecord.matches("org/acct/local_abc.json"));
         assert!(!FileRule::CoworkRecord.matches("org/acct/other.json"));
-    }
-
-    #[test]
-    fn fingerprints_cover_db_sidecars_and_cowork_extent() {
-        let rows = vec![
-            TreeRow {
-                rel: "s/store.db".into(),
-                mtime_ns: 1,
-                size: 10,
-            },
-            TreeRow {
-                rel: "s/store.db-wal".into(),
-                mtime_ns: 2,
-                size: 4,
-            },
-        ];
-        let with_wal = file_fingerprint(0, &rows, FileRule::Ext("db"));
-        let rows_without = &rows[..1];
-        let without_wal = file_fingerprint(0, rows_without, FileRule::Ext("db"));
-        assert_ne!(with_wal, without_wal);
-    }
-
-    #[test]
-    fn session_dir_markers_detect_grok_and_fx() {
-        // Marker-file detection runs in scan_session_dirs; this exercises the
-        // pure rule: file named events.jsonl makes its parent a session dir.
-        let rows = vec![
-            TreeRow {
-                rel: "abc/events.jsonl".into(),
-                mtime_ns: 1,
-                size: 5,
-            },
-            TreeRow {
-                rel: "abc/session.json".into(),
-                mtime_ns: 1,
-                size: 5,
-            },
-            TreeRow {
-                rel: "other/readme.txt".into(),
-                mtime_ns: 1,
-                size: 5,
-            },
-        ];
-        let mut dirs = BTreeSet::new();
-        for row in &rows {
-            if let Some((parent, name)) = row.rel.rsplit_once('/') {
-                if ["updates.jsonl", "chat_history.jsonl", "events.jsonl"].contains(&name) {
-                    dirs.insert(parent.to_string());
-                }
-            }
-        }
-        assert_eq!(dirs.iter().next().map(String::as_str), Some("abc"));
     }
 
     #[test]
@@ -813,15 +615,19 @@ mod tests {
                 session_id: "s1".into(),
                 repo_key: Some("https://x/y".into()),
                 state: RecordState::Ready,
-                started_at: Utc::now(),
-                updated_at: None,
-                last_message_at: None,
-                message_count: 3,
-                content_hash: "abc".into(),
-                title: None,
-                cwd: None,
-                git_branch: None,
-                model: None,
+                freshness: Freshness {
+                    updated_at: None,
+                    last_message_at: None,
+                    message_count: 3,
+                    content_hash: "abc".into(),
+                },
+                info: Info {
+                    started_at: Utc::now(),
+                    title: None,
+                    cwd: None,
+                    git_branch: None,
+                    model: None,
+                },
             },
         );
         let bytes = serde_json::to_vec(&state).unwrap();
