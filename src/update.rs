@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -72,7 +71,7 @@ fn verify(binary: &[u8], checksum: &str, name: &str) -> Result<()> {
     {
         return Err(Error::msg("invalid SHA-256 checksum file"));
     }
-    let actual = hex::encode(Sha256::digest(binary));
+    let actual = crate::fsutil::sha256_hex(binary);
     if !actual.eq_ignore_ascii_case(parts[0]) {
         return Err(Error::msg("release binary failed SHA-256 verification"));
     }
@@ -224,7 +223,7 @@ mod tests {
     #[test]
     fn checksum_rejects_tampering_and_wrong_filename() {
         let name = "agent-transcript.exe";
-        let sum = format!("{}  {name}\n", hex::encode(Sha256::digest(b"binary")));
+        let sum = format!("{}  {name}\n", crate::fsutil::sha256_hex(b"binary"));
         verify(b"binary", &sum, name).unwrap();
         assert!(verify(b"tampered", &sum, name).is_err());
         assert!(verify(b"binary", &sum, "other.exe").is_err());

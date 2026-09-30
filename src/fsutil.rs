@@ -34,8 +34,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// sha256 hex digest of `bytes` — the shared hashing form behind content
+/// hashes, repo digests, and integrity checks.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
 /// sha256 hex digest naming a repository key — the shared form for local
 /// cache paths and R2 object names derived from a repo key.
 pub fn repo_digest(repo_key: &str) -> String {
-    hex::encode(Sha256::digest(repo_key.as_bytes()))
+    sha256_hex(repo_key.as_bytes())
 }

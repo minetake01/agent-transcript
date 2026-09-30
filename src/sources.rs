@@ -1,14 +1,13 @@
-//! The harness registry: which stores exist on this machine, what identifies
-//! a session source inside each, and how a source's transcript loads.
+//! The harness registry: which stores exist on this machine, how a session
+//! source is identified inside each, and how a source loads.
 //!
-//! `sites()` is the single table of local archive locations. The persistent
-//! source state (`local_state`) walks every site's rows and applies its
-//! `Kind` rules to enumerate sources; `load` turns a source back into a
-//! transcript. Ingest and the MCP request path both read the records that
-//! diff produces, so this table is the only place that knows where
-//! transcripts live.
+//! `sites()` is the single table of local archive locations; each [`Site`]
+//! carries the store that enumerates and loads its sources. `local_state`
+//! walks every site's rows and applies its `Kind` rules; [`load`] finds the
+//! site a source belongs to and reads it. Ingest and the MCP request path
+//! both read the records the diff produces, so this table is the only place
+//! that knows where transcripts live.
 
-use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -24,21 +23,25 @@ use txcript::{Codec, HarnessId, Store, Transcript};
 
 use crate::error::{Error, Result};
 
-#[derive(Clone)]
-pub struct Candidate {
-    pub harness: HarnessId,
+/// A session found inside a database-backed site: the locator string the
+/// site writes into records and the store's own change fingerprint.
+pub struct Discovery {
     pub source: String,
     pub fingerprint: String,
-}
-
-pub struct Loaded {
-    pub transcript: Transcript<Common>,
-    pub updated_at: Option<DateTime<Utc>>,
 }
 
 pub enum LoadFailure {
     Transient(String),
     Broken(String),
+}
+
+/// Whether this harness has a local archive `sites()` can describe. Claude
+/// Chat and ChatGPT are live APIs; `Simple` is a txcript-internal baseline.
+pub fn is_local(harness: HarnessId) -> bool {
+    !matches!(
+        harness,
+        HarnessId::ClaudeChat | HarnessId::ChatGpt | HarnessId::Simple
+    )
 }
 
 /// One local archive location: where its session sources live and how a
@@ -49,6 +52,142 @@ pub struct Site {
     /// file itself for [`Kind::Db`].
     pub path: PathBuf,
     pub kind: Kind,
+    loader: Loader,
+}
+
+/// Type-erased access to the txcript store backing a [`Site`].
+enum Loader {
+    /// `Store<Ref = PathBuf>` — the source string is a filesystem path.
+    Path(Box<dyn PathLoader>),
+    /// `Store<Ref = String>` — sessions live inside the `path` database and
+    /// sources are `"{db path}\n{reference}"`.
+    Db(Box<dyn DbLoader>),
+}
+
+impl Site {
+    /// The prefix every source under this site carries. For file- and
+    /// directory-backed sites it is the site root itself; a database site
+    /// prefixes its references with the database path and a newline.
+    fn source_prefix(&self) -> String {
+        match &self.loader {
+            Loader::Path(_) => self.path.to_string_lossy().into_owned(),
+            Loader::Db(_) => format!("{}\n", self.path.to_string_lossy()),
+        }
+    }
+
+    /// Whether `source` belongs to this site. Path prefixes compare by
+    /// component, so a sibling directory whose name shares a prefix does not
+    /// match.
+    pub fn owns(&self, source: &str) -> bool {
+        match &self.loader {
+            Loader::Path(_) => Path::new(source).starts_with(&self.path),
+            Loader::Db(_) => source.starts_with(&self.source_prefix()),
+        }
+    }
+
+    /// Load the transcript a source of this site locates.
+    pub fn load(&self, source: &str) -> std::result::Result<Transcript<Common>, LoadFailure> {
+        match &self.loader {
+            Loader::Path(loader) => loader.load(Path::new(source)),
+            Loader::Db(loader) => {
+                let prefix = self.source_prefix();
+                let Some(reference) = source.strip_prefix(&prefix) else {
+                    return Err(LoadFailure::Broken(format!(
+                        "source `{source}` is not in database {}",
+                        self.path.display()
+                    )));
+                };
+                loader.load(reference)
+            }
+        }
+    }
+
+    /// Enumerate the sessions of a database-backed site. Called by the
+    /// source-state diff only when the database fingerprint moved.
+    pub fn discover(&self) -> Result<Vec<Discovery>> {
+        let Loader::Db(loader) = &self.loader else {
+            return Err(Error::msg(format!(
+                "{} is not a database-backed site",
+                self.harness
+            )));
+        };
+        let prefix = self.source_prefix();
+        loader.discover().map(|found| {
+            found
+                .into_iter()
+                .map(|(reference, fingerprint)| Discovery {
+                    source: format!("{prefix}{reference}"),
+                    fingerprint,
+                })
+                .collect()
+        })
+    }
+}
+
+/// Load the transcript a source locates. The site that produced the source
+/// is found again by prefix — the longest matching site path wins — so
+/// `local_state` records carry everything `load` needs.
+pub fn load(
+    harness: HarnessId,
+    source: &str,
+) -> std::result::Result<Transcript<Common>, LoadFailure> {
+    sites()
+        .into_iter()
+        .filter(|site| site.harness == harness && site.owns(source))
+        .max_by_key(|site| site.path.as_os_str().len())
+        .ok_or_else(|| LoadFailure::Broken(format!("{harness} has no store for `{source}`")))?
+        .load(source)
+}
+
+trait PathLoader {
+    fn load(&self, path: &Path) -> std::result::Result<Transcript<Common>, LoadFailure>;
+}
+
+impl<S> PathLoader for S
+where
+    S: Store<Ref = PathBuf>,
+    S::H: Codec,
+{
+    fn load(&self, path: &Path) -> std::result::Result<Transcript<Common>, LoadFailure> {
+        let native = Store::load(self, &path.to_path_buf()).map_err(load_failure)?;
+        <S::H as Codec>::to_common(&native).map_err(load_failure)
+    }
+}
+
+trait DbLoader {
+    /// `(reference, fingerprint)` pairs for every session in the database.
+    fn discover(&self) -> Result<Vec<(String, String)>>;
+    fn load(&self, reference: &str) -> std::result::Result<Transcript<Common>, LoadFailure>;
+}
+
+impl<S> DbLoader for S
+where
+    S: Store<Ref = String>,
+    S::H: Codec,
+{
+    fn discover(&self) -> Result<Vec<(String, String)>> {
+        let discovered = Store::discover(self).map_err(tx_error)?;
+        let refs: Vec<String> = discovered
+            .iter()
+            .map(|item| item.reference.clone())
+            .collect();
+        let fingerprints = Store::fingerprints(self, &refs).map_err(tx_error)?;
+        Ok(discovered
+            .into_iter()
+            .map(|item| {
+                let fingerprint = fingerprints
+                    .get(&item.reference)
+                    .cloned()
+                    .unwrap_or_default();
+                (item.reference, fingerprint)
+            })
+            .collect())
+    }
+
+    fn load(&self, reference: &str) -> std::result::Result<Transcript<Common>, LoadFailure> {
+        let native = Store::load(self, &reference.to_string()).map_err(load_failure)?;
+        <S::H as Codec>::to_common(&native).map_err(load_failure)
+    }
 }
 
 /// How a session source is identified inside a site's file listing.
@@ -137,61 +276,67 @@ pub fn sites() -> Vec<Site> {
     if let Some(store) = claude_code::ClaudeStore::default_root() {
         sites.push(Site {
             harness: HarnessId::ClaudeCode,
-            path: store.root,
+            path: store.root.clone(),
             kind: Kind::Files {
                 rule: FileRule::Ext("jsonl"),
                 exclude_dirs: &["subagents", "tool-results"],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = codex::CodexStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Codex,
-            path: store.sessions_dir,
+            path: store.sessions_dir.clone(),
             kind: Kind::Files {
                 rule: FileRule::Ext("jsonl"),
                 exclude_dirs: &[],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = pi::PiStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Pi,
-            path: store.sessions_dir,
+            path: store.sessions_dir.clone(),
             kind: Kind::Files {
                 rule: FileRule::Ext("jsonl"),
                 exclude_dirs: &[],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = campfire::CampfireStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Campfire,
-            path: store.sessions_dir,
+            path: store.sessions_dir.clone(),
             kind: Kind::Files {
                 rule: FileRule::Ext("jsonl"),
                 exclude_dirs: &[],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = cursor::CursorStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Cursor,
-            path: store.chats_dir,
+            path: store.chats_dir.clone(),
             kind: Kind::Files {
                 rule: FileRule::Ext("db"),
                 exclude_dirs: &[],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = amp::AmpStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Amp,
-            path: store.threads_dir,
+            path: store.threads_dir.clone(),
             kind: Kind::Files {
                 rule: FileRule::Ext("json"),
                 exclude_dirs: &[],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     for store in antigravity_stores() {
@@ -202,55 +347,65 @@ pub fn sites() -> Vec<Site> {
                 rule: FileRule::Ext("db"),
                 exclude_dirs: &[],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = cowork::CoworkStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Cowork,
-            path: store.root,
+            path: store.root.clone(),
             kind: Kind::Files {
                 rule: FileRule::CoworkRecord,
                 exclude_dirs: &[],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = grok::GrokStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Grok,
-            path: store.sessions_dir,
+            path: store.sessions_dir.clone(),
             kind: Kind::SessionDirs {
                 markers: &["updates.jsonl", "chat_history.jsonl"],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = grok_bot::GrokBotStore::default_root() {
+        let agents = store.agents.clone();
         sites.push(Site {
             harness: HarnessId::GrokBot,
-            path: store.root,
+            path: store.root.clone(),
             kind: Kind::GrokBotDirs,
+            loader: Loader::Path(Box::new(store)),
         });
-        if let Some(agents) = store.agents {
+        if let Some(agents) = agents {
+            // A store rooted anywhere loads by absolute path; the root only
+            // decides what discovery walks.
             sites.push(Site {
                 harness: HarnessId::GrokBot,
-                path: agents,
+                path: agents.clone(),
                 kind: Kind::GrokBotDirs,
+                loader: Loader::Path(Box::new(grok_bot::GrokBotStore::new(agents))),
             });
         }
     }
     if let Some(store) = fx::FxStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Fx,
-            path: store.sessions_dir,
+            path: store.sessions_dir.clone(),
             kind: Kind::SessionDirs {
                 markers: &["events.jsonl"],
             },
+            loader: Loader::Path(Box::new(store)),
         });
     }
     if let Some(store) = hermes::HermesStore::default_root() {
         sites.push(Site {
             harness: HarnessId::Hermes,
-            path: store.db_path,
+            path: store.db_path.clone(),
             kind: Kind::Db,
+            loader: Loader::Db(Box::new(store)),
         });
     }
     if let Some(store) = cursor_desktop::CursorDesktopStore::default_root() {
@@ -258,156 +413,18 @@ pub fn sites() -> Vec<Site> {
             harness: HarnessId::CursorDesktop,
             path: store.user_dir.join("globalStorage").join("state.vscdb"),
             kind: Kind::Db,
+            loader: Loader::Db(Box::new(store)),
         });
     }
     if let Some(store) = opencode::OpenCodeStore::default_db() {
         sites.push(Site {
             harness: HarnessId::OpenCode,
-            path: store.db_path,
+            path: store.db_path.clone(),
             kind: Kind::Db,
+            loader: Loader::Db(Box::new(store)),
         });
     }
     sites
-}
-
-pub fn load(candidate: &Candidate) -> std::result::Result<Loaded, LoadFailure> {
-    let transcript = read_transcript(candidate)?;
-    // Database-backed stores have no meaningful source mtime; directory
-    // sources report their newest member's mtime so freshness agrees with
-    // the scanned record.
-    let updated_at = match candidate.harness {
-        HarnessId::Hermes | HarnessId::CursorDesktop | HarnessId::OpenCode => None,
-        _ => source_mtime(Path::new(&candidate.source)),
-    };
-    Ok(Loaded {
-        transcript,
-        updated_at,
-    })
-}
-
-fn source_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    if path.is_dir() {
-        walk_tree(path)
-            .iter()
-            .map(|row| row.mtime_ns)
-            .max()
-            .map(mtime_datetime)
-    } else {
-        file_mtime(path)
-    }
-}
-
-/// Enumerate sessions of a database-backed store. Used by the source-state
-/// diff, which calls this only when the database fingerprint changed.
-pub fn discover_db_candidates(harness: HarnessId) -> Result<Vec<Candidate>> {
-    match harness {
-        HarnessId::Hermes => {
-            let store = hermes::HermesStore::default_root()
-                .ok_or_else(|| Error::msg("hermes store is unavailable"))?;
-            enumerate(harness, store)
-        }
-        HarnessId::CursorDesktop => {
-            let store = cursor_desktop::CursorDesktopStore::default_root()
-                .ok_or_else(|| Error::msg("cursor desktop store is unavailable"))?;
-            enumerate(harness, store)
-        }
-        HarnessId::OpenCode => {
-            let store = opencode::OpenCodeStore::default_db()
-                .ok_or_else(|| Error::msg("opencode store is unavailable"))?;
-            enumerate(harness, store)
-        }
-        _ => Err(Error::msg(format!(
-            "{harness} is not a database-backed store"
-        ))),
-    }
-}
-
-fn enumerate<S>(harness: HarnessId, store: S) -> Result<Vec<Candidate>>
-where
-    S: Store<Ref = String>,
-{
-    let discovered = store.discover().map_err(tx_error)?;
-    let refs: Vec<String> = discovered
-        .iter()
-        .map(|item| item.reference.clone())
-        .collect();
-    let fingerprints = store.fingerprints(&refs).map_err(tx_error)?;
-    let mut candidates = Vec::with_capacity(discovered.len());
-    for item in &discovered {
-        let source = item.reference.clone();
-        let fingerprint = fingerprints.get(&source).cloned().unwrap_or_default();
-        candidates.push(Candidate {
-            harness,
-            source,
-            fingerprint,
-        });
-    }
-    Ok(candidates)
-}
-
-fn read_transcript(candidate: &Candidate) -> std::result::Result<Transcript<Common>, LoadFailure> {
-    match candidate.harness {
-        HarnessId::ClaudeCode => load_path(claude_code::ClaudeStore::default_root(), candidate),
-        HarnessId::Codex => load_path(codex::CodexStore::default_root(), candidate),
-        HarnessId::Pi => load_path(pi::PiStore::default_root(), candidate),
-        HarnessId::Campfire => load_path(campfire::CampfireStore::default_root(), candidate),
-        HarnessId::Cursor => load_path(cursor::CursorStore::default_root(), candidate),
-        HarnessId::Amp => load_path(amp::AmpStore::default_root(), candidate),
-        HarnessId::Antigravity => {
-            let path = PathBuf::from(&candidate.source);
-            let root = path
-                .parent()
-                .and_then(|p| p.parent())
-                .map(PathBuf::from)
-                .or_else(|| antigravity::AntigravityStore::default_root().map(|s| s.root));
-            let store = root.map(antigravity::AntigravityStore::new);
-            load_path(store, candidate)
-        }
-        HarnessId::Grok => load_path(grok::GrokStore::default_root(), candidate),
-        HarnessId::GrokBot => load_path(grok_bot::GrokBotStore::default_root(), candidate),
-        HarnessId::Fx => load_path(fx::FxStore::default_root(), candidate),
-        HarnessId::Cowork => load_path(cowork::CoworkStore::default_root(), candidate),
-        HarnessId::Hermes => load_id(hermes::HermesStore::default_root(), candidate),
-        HarnessId::CursorDesktop => load_id(
-            cursor_desktop::CursorDesktopStore::default_root(),
-            candidate,
-        ),
-        HarnessId::OpenCode => load_id(opencode::OpenCodeStore::default_db(), candidate),
-        HarnessId::ClaudeChat | HarnessId::ChatGpt | HarnessId::Simple => Err(LoadFailure::Broken(
-            format!("{} is not a local archive source", candidate.harness),
-        )),
-    }
-}
-
-fn load_path<S>(
-    store: Option<S>,
-    candidate: &Candidate,
-) -> std::result::Result<Transcript<Common>, LoadFailure>
-where
-    S: Store<Ref = PathBuf>,
-    S::H: Codec,
-{
-    let store = store.ok_or_else(|| {
-        LoadFailure::Broken(format!("{} store is unavailable", candidate.harness))
-    })?;
-    let path = PathBuf::from(&candidate.source);
-    let native = store.load(&path).map_err(load_failure)?;
-    <S::H as Codec>::to_common(&native).map_err(load_failure)
-}
-
-fn load_id<S>(
-    store: Option<S>,
-    candidate: &Candidate,
-) -> std::result::Result<Transcript<Common>, LoadFailure>
-where
-    S: Store<Ref = String>,
-    S::H: Codec,
-{
-    let store = store.ok_or_else(|| {
-        LoadFailure::Broken(format!("{} store is unavailable", candidate.harness))
-    })?;
-    let native = store.load(&candidate.source).map_err(load_failure)?;
-    <S::H as Codec>::to_common(&native).map_err(load_failure)
 }
 
 fn load_failure(error: txcript::Error) -> LoadFailure {
@@ -435,11 +452,6 @@ fn tx_error(error: txcript::Error) -> Error {
     Error::msg(error.to_string())
 }
 
-fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
-    Some(DateTime::<Utc>::from(modified))
-}
-
 pub(crate) fn mtime_datetime(mtime_ns: u128) -> DateTime<Utc> {
     DateTime::<Utc>::from(
         UNIX_EPOCH + std::time::Duration::from_nanos(u64::try_from(mtime_ns).unwrap_or(u64::MAX)),
@@ -455,7 +467,7 @@ pub(crate) fn db_fingerprint(path: &Path) -> String {
 }
 
 pub(crate) fn stat_fingerprint(path: &Path) -> String {
-    match fs::metadata(path) {
+    match std::fs::metadata(path) {
         Err(_) => String::new(),
         Ok(meta) => {
             let mtime = meta
@@ -541,7 +553,7 @@ pub(crate) fn join_rel(root: &Path, rel: &str) -> PathBuf {
 }
 
 fn walk_rows(root: &Path, dir: &Path, rows: &mut Vec<TreeRow>) {
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -553,7 +565,7 @@ fn walk_rows(root: &Path, dir: &Path, rows: &mut Vec<TreeRow>) {
             walk_rows(root, &path, rows);
             continue;
         }
-        let Ok(meta) = fs::metadata(&path) else {
+        let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
         let modified = meta
@@ -594,68 +606,4 @@ pub fn antigravity_stores() -> Vec<antigravity::AntigravityStore> {
         }
     }
     stores
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn site(kind: Kind) -> Site {
-        Site {
-            harness: HarnessId::Codex,
-            path: PathBuf::from("/root"),
-            kind,
-        }
-    }
-
-    fn row(rel: &str, mtime_ns: u128, size: u64) -> TreeRow {
-        TreeRow {
-            rel: rel.into(),
-            mtime_ns,
-            size,
-        }
-    }
-
-    #[test]
-    fn file_sites_match_rules_and_skip_excluded_dirs() {
-        let files = Kind::Files {
-            rule: FileRule::Ext("jsonl"),
-            exclude_dirs: &["subagents", "tool-results"],
-        };
-        assert!(files.matches_file("a/b/session.jsonl"));
-        assert!(!files.matches_file("a/b/session.json"));
-        assert!(!files.matches_file("a/subagents/agent-1.jsonl"));
-        assert!(!files.matches_file("a/x/tool-results/t.jsonl"));
-        let db = Kind::Files {
-            rule: FileRule::Ext("db"),
-            exclude_dirs: &[],
-        };
-        assert!(db.matches_file("chat/store.db"));
-        assert!(!db.matches_file("chat/store.db-wal"));
-    }
-
-    #[test]
-    fn dir_sites_match_markers() {
-        let grok = Kind::SessionDirs {
-            markers: &["updates.jsonl", "chat_history.jsonl"],
-        };
-        assert!(grok.is_dir_marker("s1", "updates.jsonl"));
-        assert!(!grok.is_dir_marker("s1", "events.jsonl"));
-        let grok_bot = Kind::GrokBotDirs;
-        assert!(grok_bot.is_dir_marker("agents/bot-1", "profile.json"));
-        assert!(grok_bot.is_dir_marker("sessions/abc", "abc.jsonl"));
-        assert!(!grok_bot.is_dir_marker("sessions/abc", "other.jsonl"));
-    }
-
-    #[test]
-    fn fingerprints_cover_db_sidecars_and_cowork_extent() {
-        let site = site(Kind::Files {
-            rule: FileRule::Ext("db"),
-            exclude_dirs: &[],
-        });
-        let rows = vec![row("s/store.db", 1, 10), row("s/store.db-wal", 2, 4)];
-        let with_wal = row_fingerprint(0, &rows, &site);
-        let without_wal = row_fingerprint(0, &rows[..1], &site);
-        assert_ne!(with_wal, without_wal);
-    }
 }

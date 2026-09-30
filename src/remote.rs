@@ -4,8 +4,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::catalog::{merge_catalogs, validate, Catalog, CATALOG_KEY};
 use crate::crypto::{self, Key};
-use crate::document::{hash_bytes, ArchiveDocument};
+use crate::document::ArchiveDocument;
 use crate::error::{Error, Result};
+use crate::fsutil::sha256_hex;
 use crate::store::{Precondition, R2};
 
 /// Decrypted object cache bounds: 512 MiB and 30 days.
@@ -24,9 +25,13 @@ pub async fn load_catalog(r2: &R2, key: &Key) -> Result<(Catalog, Option<String>
     }
 }
 
-pub async fn commit_catalog(r2: &R2, key: &Key, incoming: &Catalog) -> Result<()> {
+/// Merge `incoming` into the remote catalog with optimistic concurrency and
+/// return the committed catalog — callers that follow with catalog-derived
+/// work (search-index rebuilds) reuse it instead of fetching again.
+pub async fn commit_catalog(r2: &R2, key: &Key, incoming: &Catalog) -> Result<Catalog> {
     if incoming.sessions.is_empty() {
-        return Ok(());
+        // Nothing to merge: the committed catalog is what is already remote.
+        return Ok(load_catalog(r2, key).await?.0);
     }
     for attempt in 1..=5 {
         let (base, etag) = load_catalog(r2, key).await?;
@@ -39,7 +44,7 @@ pub async fn commit_catalog(r2: &R2, key: &Key, incoming: &Catalog) -> Result<()
             None => Precondition::IfNoneMatchStar,
         };
         match r2.put(CATALOG_KEY, blob, precondition).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(merged),
             Err(Error::Precondition) if attempt < 5 => continue,
             Err(error) => return Err(error),
         }
@@ -56,7 +61,7 @@ pub async fn load_plaintext(
 ) -> Result<Vec<u8>> {
     let cached = cache_dir.join(format!("{content_hash}.json"));
     if let Ok(bytes) = fs::read(&cached) {
-        if hash_bytes(&bytes) == content_hash {
+        if sha256_hex(&bytes) == content_hash {
             if let Ok(handle) = fs::OpenOptions::new().write(true).open(&cached) {
                 let _ = handle.set_modified(std::time::SystemTime::now());
             }
@@ -69,7 +74,7 @@ pub async fn load_plaintext(
         .await?
         .ok_or_else(|| Error::msg(format!("catalog points at missing object `{object_key}`")))?;
     let plain = crypto::decrypt(key, object_key, &fetched.body)?;
-    if hash_bytes(&plain) != content_hash {
+    if sha256_hex(&plain) != content_hash {
         return Err(Error::msg(format!(
             "object `{object_key}` does not match catalog hash `{content_hash}`"
         )));
@@ -127,7 +132,7 @@ pub fn prune_plaintext_cache(dir: &Path) {
 
 pub fn document_from_plaintext(bytes: &[u8]) -> Result<ArchiveDocument> {
     let document: ArchiveDocument = serde_json::from_slice(bytes)?;
-    if document.schema != crate::catalog::SCHEMA {
+    if document.schema != crate::document::SCHEMA {
         return Err(Error::Schema {
             schema: document.schema,
         });

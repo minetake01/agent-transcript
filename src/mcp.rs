@@ -19,14 +19,14 @@ use txcript::HarnessId;
 use crate::catalog::{Catalog, CATALOG_KEY};
 use crate::config;
 use crate::error::Error;
-use crate::fragment::parse_ref;
 use crate::local_state::LocalStore;
 use crate::merge::MergedView;
 use crate::read;
 use crate::remote;
-use crate::repo_id::{self, OriginError};
+use crate::repo_id::{self, RepoResolution};
 use crate::search_index;
 use crate::sessions::{self, find_session};
+use crate::sources;
 use crate::store::R2;
 
 /// Cached catalogs may lag the bucket by this much; an expired cache is
@@ -138,14 +138,13 @@ struct App {
     launch_dir: PathBuf,
     can_write: bool,
     /// Persistent per-source session records; `diff()` refreshes them with a
-    /// stat-only scan on every request.
+    /// stat-only scan on every request. Also owns the shared directory →
+    /// repo-key resolution cache.
     local: Mutex<LocalStore>,
     /// The decrypted catalog, refreshed at most every `CATALOG_MAX_AGE` via
     /// an ETag probe.
     catalog: RwLock<CatalogSlot>,
     catalog_sync: tokio::sync::Mutex<()>,
-    /// Directory → repo key; `git remote get-url` runs once per directory.
-    repos: RwLock<HashMap<PathBuf, String>>,
     /// Per-repository search runtimes, incrementally synced per request.
     indexes: RwLock<HashMap<String, Arc<RwLock<search_index::Runtime>>>>,
 }
@@ -250,20 +249,17 @@ impl ArchiveServer {
         let from = parse_from(request.from.as_deref())?;
         refuse_live(from)?;
         let (_, merged) = self.merged(request.cwd.as_deref(), from, &peer).await?;
-        let (view, range) = {
-            let (view, range) = find_session(&merged, &request.id).map_err(tool_error)?;
-            (view.clone(), range)
-        };
+        let (view, matched, range) = find_session(&merged, &request.id).map_err(tool_error)?;
         let label = if range.is_some() {
-            parse_ref(&request.id).0.to_string()
+            matched
         } else {
-            view.session_id.clone()
+            &view.session_id
         };
         let transcript =
-            sessions::transcript(&self.app.r2, &self.app.key, &self.app.cache_dir, &view)
+            sessions::transcript(&self.app.r2, &self.app.key, &self.app.cache_dir, view)
                 .await
                 .map_err(tool_error)?;
-        read::render(&label, &transcript, range.as_ref())
+        read::render(label, &transcript, range.as_ref())
             .map_err(|error| ErrorData::invalid_params(error, None))
     }
 }
@@ -277,8 +273,7 @@ impl ArchiveServer {
         from: Option<HarnessId>,
         peer: &Peer<RoleServer>,
     ) -> Result<(String, Vec<MergedView>), ErrorData> {
-        let directory = self.workspace_directory(cwd, peer).await?;
-        let repo_key = self.repo_key(&directory)?;
+        let repo_key = self.request_repo_key(cwd, peer).await?;
         self.ensure_catalog().await?;
 
         let app = Arc::clone(&self.app);
@@ -288,7 +283,7 @@ impl ArchiveServer {
                 .lock()
                 .map_err(|_| Error::msg("local state lock poisoned"))?;
             local.diff()?;
-            let views = sessions::local_views(&local)?;
+            let views = sessions::local_views(&local);
             if let Err(error) = local.save_if_dirty() {
                 eprintln!("agent-transcript: saving local state: {error}");
             }
@@ -383,36 +378,80 @@ impl ArchiveServer {
         }
     }
 
-    async fn workspace_directory(
+    /// The repository a request addresses: the explicit `cwd`, the client
+    /// workspace roots, or the launch directory — resolved through the
+    /// shared persistent cache so `git` runs at most once per directory per
+    /// retry window.
+    async fn request_repo_key(
         &self,
         cwd: Option<&str>,
         peer: &Peer<RoleServer>,
-    ) -> Result<PathBuf, ErrorData> {
+    ) -> Result<String, ErrorData> {
         match cwd {
             // The same normalization the `index` command applies: file URIs,
             // `/d:/…` forms, and relative paths anchored at the launch dir.
-            Some(cwd) => Ok(repo_id::scope_directory(
+            Some(cwd) => self.repo_key_for(&repo_id::scope_directory(
                 Some(Path::new(cwd)),
                 &self.app.launch_dir,
             )),
-            None => directory_for_omitted_cwd(peer, &self.app.launch_dir)
-                .await
-                .map_err(tool_error),
+            None => self.omitted_repo_key(peer).await,
         }
     }
 
-    fn repo_key(&self, directory: &Path) -> Result<String, ErrorData> {
-        if let Ok(repos) = self.app.repos.read() {
-            if let Some(key) = repos.get(directory) {
-                return Ok(key.clone());
+    /// The repo key for one directory, through the persistent cache.
+    fn repo_key_for(&self, directory: &Path) -> Result<String, ErrorData> {
+        let mut local = self
+            .app
+            .local
+            .lock()
+            .map_err(|_| tool_error(Error::msg("local state lock poisoned")))?;
+        let resolution = local.resolve_directory(directory);
+        if let Err(error) = local.save_if_dirty() {
+            eprintln!("agent-transcript: saving local state: {error}");
+        }
+        resolution.into_key(directory).map_err(tool_error)
+    }
+
+    /// An omitted `cwd` selects the repository from the client's workspace
+    /// roots; without roots the launch directory is the answer — a missing
+    /// or malformed origin surfaces from the resolution itself.
+    async fn omitted_repo_key(&self, peer: &Peer<RoleServer>) -> Result<String, ErrorData> {
+        if client_has_roots(peer) {
+            let roots = list_workspace_roots(peer).await.map_err(tool_error)?;
+            if !roots.is_empty() {
+                return self.repo_key_from_roots(&roots);
             }
         }
-        let key = repo_id::origin_of(directory)
-            .map_err(|error| tool_error(Error::msg(error.to_string())))?;
-        if let Ok(mut repos) = self.app.repos.write() {
-            repos.insert(directory.to_path_buf(), key.clone());
+        self.repo_key_for(&self.app.launch_dir)
+    }
+
+    /// The single repository a workspace's roots identify. Roots that
+    /// resolve to no repository are tolerated; roots that resolve to
+    /// different repositories are rejected.
+    fn repo_key_from_roots(&self, uris: &[String]) -> Result<String, ErrorData> {
+        let mut resolved = Vec::new();
+        let mut unresolved = Vec::new();
+        {
+            let mut local = self
+                .app
+                .local
+                .lock()
+                .map_err(|_| tool_error(Error::msg("local state lock poisoned")))?;
+            for uri in uris {
+                let directory = root_directory(uri).map_err(tool_error)?;
+                match local.resolve_directory(&directory) {
+                    RepoResolution::Key(key) => resolved.push(key),
+                    RepoResolution::NoOrigin => unresolved.push(directory),
+                    RepoResolution::Failed(error) => {
+                        return Err(tool_error(Error::msg(error)));
+                    }
+                }
+            }
+            if let Err(error) = local.save_if_dirty() {
+                eprintln!("agent-transcript: saving local state: {error}");
+            }
         }
-        Ok(key)
+        one_repository_key(resolved, &unresolved).map_err(tool_error)
     }
 
     /// The search runtime for a repository — the in-memory instance, the
@@ -563,26 +602,6 @@ impl ArchiveServer {
     }
 }
 
-struct ResolvedRoot {
-    directory: PathBuf,
-    origin: String,
-}
-
-async fn directory_for_omitted_cwd(
-    peer: &Peer<RoleServer>,
-    launch_dir: &Path,
-) -> crate::Result<PathBuf> {
-    if client_has_roots(peer) {
-        let roots = list_workspace_roots(peer).await?;
-        if !roots.is_empty() {
-            return directory_from_roots(&roots);
-        }
-    }
-    // The launch directory is always the answer; a missing or malformed
-    // origin surfaces from the repo-key resolution that follows.
-    Ok(launch_dir.to_path_buf())
-}
-
 fn client_has_roots(peer: &Peer<RoleServer>) -> bool {
     peer.peer_info()
         .is_some_and(|info| info.capabilities.roots.is_some())
@@ -599,39 +618,6 @@ async fn list_workspace_roots(peer: &Peer<RoleServer>) -> crate::Result<Vec<Stri
     Ok(listed.roots.into_iter().map(|root| root.uri).collect())
 }
 
-fn directory_from_roots(uris: &[String]) -> crate::Result<PathBuf> {
-    let mut directories = Vec::new();
-    let mut resolved = Vec::new();
-    for uri in uris {
-        let directory = root_directory(uri)?;
-        if let Some(origin) = origin_at(&directory)? {
-            resolved.push(ResolvedRoot { directory, origin });
-        } else {
-            directories.push(directory);
-        }
-    }
-    if resolved.is_empty() {
-        return Err(Error::msg(format!(
-            "workspace roots do not identify a repository: {}",
-            directories
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
-    one_repository(&resolved)
-}
-
-fn origin_at(dir: &Path) -> crate::Result<Option<String>> {
-    match repo_id::origin_of(dir) {
-        Ok(origin) => Ok(Some(origin)),
-        Err(OriginError::NoOrigin { .. }) => Ok(None),
-        Err(OriginError::GitMissing) => Err(Error::msg("git is not installed")),
-        Err(OriginError::Invalid { message }) => Err(Error::msg(message)),
-    }
-}
-
 fn root_directory(uri: &str) -> crate::Result<PathBuf> {
     // Shared cwd normalization: file URIs and `/d:/…` forms become paths.
     let path = repo_id::normalize_cwd(uri);
@@ -643,20 +629,29 @@ fn root_directory(uri: &str) -> crate::Result<PathBuf> {
     Ok(path)
 }
 
-fn one_repository(roots: &[ResolvedRoot]) -> crate::Result<PathBuf> {
-    let Some(first) = roots.first() else {
-        return Err(Error::msg("workspace roots do not identify a repository"));
-    };
-    let mut origins: Vec<&str> = roots.iter().map(|root| root.origin.as_str()).collect();
-    origins.sort_unstable();
-    origins.dedup();
-    if origins.len() != 1 {
+/// The single repository a workspace's roots identify, or why the request
+/// cannot pick one. Roots that resolve to no repository are tolerated;
+/// roots that resolve to different repositories are rejected.
+fn one_repository_key(mut resolved: Vec<String>, unresolved: &[PathBuf]) -> crate::Result<String> {
+    if resolved.is_empty() {
         return Err(Error::msg(format!(
-            "workspace roots identify more than one repository: {}",
-            origins.join(", ")
+            "workspace roots do not identify a repository: {}",
+            unresolved
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
-    Ok(first.directory.clone())
+    resolved.sort_unstable();
+    resolved.dedup();
+    if resolved.len() != 1 {
+        return Err(Error::msg(format!(
+            "workspace roots identify more than one repository: {}",
+            resolved.join(", ")
+        )));
+    }
+    Ok(resolved.into_iter().next().unwrap())
 }
 
 #[allow(unknown_lints, clippy::unused_async_trait_impl)]
@@ -704,7 +699,6 @@ pub async fn serve(launch_dir: &Path) -> Result<(), String> {
         local: Mutex::new(LocalStore::load(&cache_dir)),
         catalog: RwLock::new(catalog),
         catalog_sync: tokio::sync::Mutex::new(()),
-        repos: RwLock::new(HashMap::new()),
         indexes: RwLock::new(HashMap::new()),
     });
     let service = server
@@ -796,12 +790,16 @@ fn parse_from(from: Option<&str>) -> Result<Option<HarnessId>, ErrorData> {
 }
 
 fn refuse_live(from: Option<HarnessId>) -> Result<(), ErrorData> {
-    if matches!(from, Some(HarnessId::ClaudeChat | HarnessId::ChatGpt)) {
-        let name = from.map_or("live source", HarnessId::as_str);
-        return Err(ErrorData::invalid_params(
-            format!("list, search, and read do not enumerate {name}"),
-            None,
-        ));
+    if let Some(harness) = from {
+        if !sources::is_local(harness) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "list, search, and read do not enumerate {}",
+                    harness.as_str()
+                ),
+                None,
+            ));
+        }
     }
     Ok(())
 }
@@ -842,31 +840,40 @@ fn strip_nested_formats(value: &mut serde_json::Value) {
 mod tests {
     use super::*;
 
-    fn resolved(directory: &str, origin: &str) -> ResolvedRoot {
-        ResolvedRoot {
-            directory: PathBuf::from(directory),
-            origin: origin.into(),
-        }
-    }
-
     #[test]
-    fn one_workspace_root_selects_that_repository() {
-        let roots = [
-            resolved(r"D:\repo", "https://example.com/repo"),
-            resolved(r"D:\repo\crate", "https://example.com/repo"),
-        ];
-        assert_eq!(one_repository(&roots).unwrap(), PathBuf::from(r"D:\repo"));
+    fn one_workspace_repository_is_selected() {
+        let key = one_repository_key(
+            vec![
+                "https://example.com/repo".into(),
+                "https://example.com/repo".into(),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(key, "https://example.com/repo");
     }
 
     #[test]
     fn several_workspace_repositories_are_rejected() {
-        let roots = [
-            resolved(r"D:\a", "https://example.com/a"),
-            resolved(r"D:\b", "https://example.com/b"),
-        ];
-        let error = one_repository(&roots).unwrap_err().to_string();
+        let error = one_repository_key(
+            vec![
+                "https://example.com/a".into(),
+                "https://example.com/b".into(),
+            ],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("https://example.com/a"), "{error}");
         assert!(error.contains("https://example.com/b"), "{error}");
+    }
+
+    #[test]
+    fn workspace_roots_without_repositories_are_rejected() {
+        let error = one_repository_key(vec![], &[PathBuf::from("/plain")])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/plain"), "{error}");
     }
 
     #[cfg(windows)]

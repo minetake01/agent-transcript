@@ -12,9 +12,8 @@
 //! Both consumers read these records: ingest uploads a revision for every
 //! `Ready` record whose content hash is absent from the catalog, and the MCP
 //! request path lists them merged with the remote archive. Database-backed
-//! stores (Hermes, Cursor Desktop, OpenCode) reuse
-//! `sources::discover_db_candidates` but only when the database file itself
-//! changed.
+//! stores (Hermes, Cursor Desktop, OpenCode) enumerate through
+//! `Site::discover` but only when the database file itself changed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -27,10 +26,10 @@ use txcript::HarnessId;
 use crate::document::ArchiveDocument;
 use crate::error::{Error, Result};
 use crate::merge::{Freshness, Info};
-use crate::repo_id::{self, SessionRepo};
-use crate::sources::{self, Candidate, Kind, LoadFailure, Site};
+use crate::repo_id::{self, OriginError, RepoResolution};
+use crate::sources::{self, Kind, LoadFailure, Site};
 
-const STATE_SCHEMA: u32 = 1;
+const STATE_SCHEMA: u32 = 2;
 const STATE_FILE: &str = "local-state.json";
 /// Failed origin resolutions are retried at most this often.
 const REPO_RETRY: Duration = Duration::minutes(5);
@@ -65,6 +64,34 @@ pub struct SourceRecord {
 struct RepoEntry {
     repo_key: Option<String>,
     checked_at: DateTime<Utc>,
+    /// Why resolution failed — surfaced to the next caller instead of a bare
+    /// "not a repository" while the failure is still cached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl RepoEntry {
+    fn of(resolution: &RepoResolution) -> Self {
+        Self {
+            repo_key: match resolution {
+                RepoResolution::Key(key) => Some(key.clone()),
+                _ => None,
+            },
+            checked_at: Utc::now(),
+            error: match resolution {
+                RepoResolution::Failed(error) => Some(error.clone()),
+                _ => None,
+            },
+        }
+    }
+
+    fn resolution(&self) -> RepoResolution {
+        match (&self.repo_key, &self.error) {
+            (Some(key), _) => RepoResolution::Key(key.clone()),
+            (None, Some(error)) => RepoResolution::Failed(error.clone()),
+            (None, None) => RepoResolution::NoOrigin,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,11 +100,15 @@ struct State {
     /// Source records keyed by `"harness\nsource"`.
     #[serde(default)]
     sources: BTreeMap<String, SourceRecord>,
-    /// cwd → repo key resolution. Failures are remembered with a timestamp
-    /// so a non-git directory does not spawn `git` on every request.
+    /// Normalized directory → repository resolution. One cache serves both
+    /// transcript `cwd` values (written at source load) and request-time
+    /// directories from MCP/workspace roots. Failures are remembered with a
+    /// timestamp so a non-git directory does not spawn `git` on every
+    /// request.
     #[serde(default)]
     repos: BTreeMap<String, RepoEntry>,
-    /// Per-harness database fingerprints for database-backed stores.
+    /// Per-site database fingerprints for database-backed stores, keyed by
+    /// site path so multiple databases under one harness stay independent.
     #[serde(default)]
     db_fingerprints: BTreeMap<String, String>,
     /// Last orphan sweep. Sweeps are rate-limited so most ingests skip the
@@ -103,12 +134,6 @@ impl State {
 pub struct Report {
     /// Bodies read this diff.
     pub loaded: usize,
-    /// Records dropped because their source vanished.
-    pub removed: usize,
-    /// Loads that failed permanently this diff.
-    pub broken: usize,
-    /// Loads that failed transiently this diff.
-    pub transient: usize,
     /// Freshly read sessions whose transcript records no usable cwd.
     pub missing_cwd: usize,
     /// Repositories whose sessions were added, changed, or removed this
@@ -145,9 +170,6 @@ impl LocalStore {
             },
             Err(_) => State::empty(),
         };
-        // State files from earlier layouts.
-        let _ = fs::remove_file(path.with_file_name("cursors.json"));
-        let _ = fs::remove_dir_all(cache_dir.join("search"));
         Self {
             path,
             state,
@@ -185,25 +207,28 @@ impl LocalStore {
     /// only for new or changed sources.
     pub fn diff(&mut self) -> Result<()> {
         self.report = Report::default();
-        for site in sources::sites() {
+        let sites = sources::sites();
+        for site in &sites {
             match &site.kind {
-                Kind::Files { .. } => self.scan_files(&site),
-                Kind::SessionDirs { .. } | Kind::GrokBotDirs => self.scan_session_dirs(&site),
+                Kind::Files { .. } => self.scan_files(site),
+                Kind::SessionDirs { .. } | Kind::GrokBotDirs => self.scan_session_dirs(site),
                 Kind::Db => {
-                    if let Err(error) = self.scan_db(&site) {
+                    if let Err(error) = self.scan_db(site) {
                         // A broken database store must not take down every
                         // query; its existing records stay until it recovers.
-                        eprintln!(
-                            "agent-transcript: {} discovery failed: {error}",
-                            site.harness
-                        );
+                        self.report.failures.push(format!(
+                            "{} {} — {error}",
+                            site.harness,
+                            site.path.display()
+                        ));
                     }
                 }
             }
         }
-        // Sources whose stores disappeared entirely: drop their records for
-        // any harness that no site covers anymore.
-        self.drop_orphan_harnesses();
+        // Sources whose site disappeared entirely (store uninstalled or
+        // moved): drop their records — sessions are files, so a missing site
+        // means missing sessions.
+        self.drop_unowned(&sites);
         self.resolve_pending();
         Ok(())
     }
@@ -262,20 +287,18 @@ impl LocalStore {
     }
 
     fn scan_db(&mut self, site: &Site) -> Result<()> {
+        let site_key = site.path.to_string_lossy().into_owned();
         let fingerprint = sources::db_fingerprint(&site.path);
-        if self.state.db_fingerprints.get(site.harness.as_str()) == Some(&fingerprint) {
+        if self.state.db_fingerprints.get(&site_key) == Some(&fingerprint) {
             return Ok(());
         }
-        let candidates = sources::discover_db_candidates(site.harness)?;
         let mut seen = HashSet::new();
-        for candidate in candidates {
-            seen.insert(source_key(site.harness, &candidate.source));
-            self.reconsider(site.harness, &candidate.source, candidate.fingerprint, None);
+        for found in site.discover()? {
+            seen.insert(source_key(site.harness, &found.source));
+            self.reconsider(site.harness, &found.source, found.fingerprint, None);
         }
-        self.drop_unseen(site.harness, None, &seen);
-        self.state
-            .db_fingerprints
-            .insert(site.harness.as_str().to_string(), fingerprint);
+        self.drop_unseen(site.harness, Some(&site_key), &seen);
+        self.state.db_fingerprints.insert(site_key, fingerprint);
         self.dirty = true;
         Ok(())
     }
@@ -315,32 +338,14 @@ impl LocalStore {
         let already_pending = self.state.sources.get(&key).is_some_and(|record| {
             record.state == RecordState::Pending && record.fingerprint == fingerprint
         });
-        let candidate = Candidate {
-            harness,
-            source: source.to_string(),
-            fingerprint: fingerprint.clone(),
-        };
-        match sources::load(&candidate) {
-            Ok(loaded) => {
+        match sources::load(harness, source) {
+            Ok(transcript) => {
                 // `Transcript` is not `Clone`; capture the meta fields before
                 // `ArchiveDocument::new` consumes it for the content hash.
-                let transcript = loaded.transcript;
                 let session_id = transcript.meta.id.clone();
-                let cwd = transcript.meta.cwd.clone();
-                let started_at = transcript.meta.timestamp;
-                let freshness_meta = Freshness {
-                    updated_at: updated_at.or(loaded.updated_at),
-                    last_message_at: transcript.body.last().map(|message| message.timestamp),
-                    message_count: transcript.body.len() as u64,
-                    content_hash: String::new(),
-                };
-                let info = Info {
-                    started_at,
-                    title: transcript.meta.title.clone(),
-                    cwd,
-                    git_branch: transcript.meta.git_branch.clone(),
-                    model: transcript.meta.model.clone(),
-                };
+                let info = Info::of(&transcript.meta);
+                let freshness_meta =
+                    Freshness::of_body(&transcript.body, updated_at, String::new());
                 let (repo_key, content_hash, mut state) = match self
                     .resolve_repo(info.cwd.as_deref())
                 {
@@ -369,7 +374,6 @@ impl LocalStore {
                 };
                 if session_id.is_empty() {
                     state = RecordState::Broken;
-                    self.report.broken += 1;
                     self.report
                         .failures
                         .push(format!("{harness} {source} — session id is empty"));
@@ -400,7 +404,6 @@ impl LocalStore {
             Err(LoadFailure::Transient(message)) => {
                 // Keep the previous record — the file is probably locked or
                 // half-written; the next diff retries it.
-                self.report.transient += 1;
                 self.report
                     .failures
                     .push(format!("{harness} {source} — transient: {message}"));
@@ -430,7 +433,6 @@ impl LocalStore {
                         },
                     },
                 );
-                self.report.broken += 1;
                 self.report
                     .failures
                     .push(format!("{harness} {source} — {message}"));
@@ -439,39 +441,45 @@ impl LocalStore {
         }
     }
 
-    /// Repos are resolved once per cwd and cached in the state file;
-    /// failures are retried every `REPO_RETRY` so a repo that gains an
-    /// origin later picks up its pending sessions.
+    /// Resolve a directory to its repository through the persistent cache.
+    /// One cache serves transcript `cwd` values and request-time
+    /// directories alike; failures are retried every `REPO_RETRY` so a repo
+    /// that gains an origin later picks up its pending sessions.
+    pub fn resolve_directory(&mut self, dir: &Path) -> RepoResolution {
+        let key = dir.to_string_lossy().into_owned();
+        if let Some(entry) = self.state.repos.get(&key) {
+            let fresh = Utc::now().signed_duration_since(entry.checked_at) < REPO_RETRY;
+            if entry.repo_key.is_some() || fresh {
+                return entry.resolution();
+            }
+        }
+        let resolution = match repo_id::origin_of(dir) {
+            Ok(key) => RepoResolution::Key(key),
+            Err(OriginError::GitMissing | OriginError::NoOrigin { .. }) => RepoResolution::NoOrigin,
+            Err(OriginError::Invalid { message }) => RepoResolution::Failed(message),
+        };
+        self.state.repos.insert(key, RepoEntry::of(&resolution));
+        self.dirty = true;
+        resolution
+    }
+
+    /// Where a session's recorded working directory leaves the record: the
+    /// resolved repo key, or why it stays pending.
     fn resolve_repo(&mut self, cwd: Option<&str>) -> SessionRepo {
         let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
             return SessionRepo::MissingCwd;
         };
-        if let Some(entry) = self.state.repos.get(cwd) {
-            let fresh = Utc::now().signed_duration_since(entry.checked_at) < REPO_RETRY;
-            if entry.repo_key.is_some() || fresh {
-                return match &entry.repo_key {
-                    Some(key) => SessionRepo::Key(key.clone()),
-                    None => SessionRepo::Unresolved("cached".into()),
-                };
-            }
+        let dir = repo_id::normalize_cwd(cwd);
+        if !dir.is_dir() {
+            return SessionRepo::MissingCwd;
         }
-        let resolved = match repo_id::session_repo(Some(cwd)) {
-            Ok(resolved) => resolved,
-            Err(error) => SessionRepo::Unresolved(error.to_string()),
-        };
-        let repo_key = match &resolved {
-            SessionRepo::Key(key) => Some(key.clone()),
-            _ => None,
-        };
-        self.state.repos.insert(
-            cwd.to_string(),
-            RepoEntry {
-                repo_key,
-                checked_at: Utc::now(),
-            },
-        );
-        self.dirty = true;
-        resolved
+        match self.resolve_directory(&dir) {
+            RepoResolution::Key(key) => SessionRepo::Key(key),
+            RepoResolution::NoOrigin => {
+                SessionRepo::Unresolved(format!("cannot resolve origin of {}", dir.display()))
+            }
+            RepoResolution::Failed(error) => SessionRepo::Unresolved(error),
+        }
     }
 
     /// Records whose source vanished under this site's root are gone.
@@ -496,39 +504,33 @@ impl LocalStore {
             }
             false
         });
-        let removed = before - self.state.sources.len();
-        if removed > 0 {
-            self.report.removed += removed;
+        if self.state.sources.len() != before {
             self.report.changed_repos.extend(removed_repos);
             self.dirty = true;
         }
     }
 
-    /// When a store root disappears entirely (harness uninstalled), its
-    /// records are dropped on the next diff — sessions are files, so a
-    /// missing store means missing sessions.
-    fn drop_orphan_harnesses(&mut self) {
-        let covered: HashSet<String> = sources::sites()
-            .iter()
-            .map(|site| site.harness.as_str().to_string())
-            .collect();
+    /// Records whose site no longer exists — the harness uninstalled or a
+    /// store root moved — are dropped on the next diff. Sessions are files,
+    /// so a missing site means missing sessions.
+    fn drop_unowned(&mut self, sites: &[Site]) {
         let mut removed_repos = Vec::new();
         let before = self.state.sources.len();
         self.state.sources.retain(|key, record| {
-            let Some((harness, _)) = key.split_once('\n') else {
+            let Some((harness, source)) = key.split_once('\n') else {
                 return false;
             };
-            if covered.contains(harness) {
-                return true;
+            let covered = sites
+                .iter()
+                .any(|site| site.harness.as_str() == harness && site.owns(source));
+            if !covered {
+                if let Some(repo_key) = &record.repo_key {
+                    removed_repos.push(repo_key.clone());
+                }
             }
-            if let Some(repo_key) = &record.repo_key {
-                removed_repos.push(repo_key.clone());
-            }
-            false
+            covered
         });
-        let removed = before - self.state.sources.len();
-        if removed > 0 {
-            self.report.removed += removed;
+        if self.state.sources.len() != before {
             self.report.changed_repos.extend(removed_repos);
             self.dirty = true;
         }
@@ -563,6 +565,13 @@ impl LocalStore {
 
 fn source_key(harness: HarnessId, source: &str) -> String {
     format!("{}\n{source}", harness.as_str())
+}
+
+/// Where a session's recorded working directory leaves its record.
+enum SessionRepo {
+    Key(String),
+    MissingCwd,
+    Unresolved(String),
 }
 
 /// Grouped session records ready for merge ranking — a lookup for

@@ -1,17 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use txcript::common::{Message, Meta};
 use txcript::HarnessId;
 
 use crate::error::{Error, Result};
-
-/// Which copy of a session supplies the body, or neither when the rank ties
-/// on different bodies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Preference {
-    Local,
-    Remote,
-    Ambiguous,
-}
 
 /// What makes one snapshot newer than another. Persisted inline in the
 /// catalog's revisions and the local source records.
@@ -21,6 +13,24 @@ pub struct Freshness {
     pub last_message_at: Option<DateTime<Utc>>,
     pub message_count: u64,
     pub content_hash: String,
+}
+
+impl Freshness {
+    /// Ranking data derived from a transcript body; `updated_at` is the
+    /// source's own mtime when it has one, and `content_hash` stays empty
+    /// until the document hash is computed.
+    pub fn of_body(
+        body: &[Message],
+        updated_at: Option<DateTime<Utc>>,
+        content_hash: String,
+    ) -> Self {
+        Self {
+            updated_at,
+            last_message_at: body.last().map(|message| message.timestamp),
+            message_count: body.len() as u64,
+            content_hash,
+        }
+    }
 }
 
 /// Session presentation metadata shared by catalog revisions, local source
@@ -34,6 +44,19 @@ pub struct Info {
     pub model: Option<String>,
 }
 
+impl Info {
+    /// Presentation fields lifted from transcript metadata.
+    pub fn of(meta: &Meta) -> Self {
+        Self {
+            started_at: meta.timestamp,
+            title: meta.title.clone(),
+            cwd: meta.cwd.clone(),
+            git_branch: meta.git_branch.clone(),
+            model: meta.model.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalView {
     pub harness: HarnessId,
@@ -43,10 +66,14 @@ pub struct LocalView {
     /// path never needs the discovery record again.
     pub source: String,
     /// Stat fingerprint of the source. Compared per request by the local
-    /// state store; also the search-cache key for local documents.
+    /// state store; also the search-index key for local documents.
     pub fingerprint: String,
     pub freshness: Freshness,
     pub info: Info,
+    /// Same-repo local copies of this session disagree on the body at the
+    /// top rank. A strictly newer remote snapshot still wins; otherwise the
+    /// session has no single body.
+    pub ambiguous: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +89,8 @@ pub struct RemoteView {
     pub ambiguous: bool,
 }
 
+/// Which copy of a session supplies the body, or neither when the rank ties
+/// on different bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pick {
     Local,
@@ -119,14 +148,17 @@ pub fn choose_current(items: &[Freshness]) -> Result<Current> {
     })
 }
 
-pub fn prefer(left: &Freshness, right: &Freshness) -> Preference {
+/// Which side's body a merged view prefers: the local copy wins rank ties,
+/// and a rank tie on different bodies has no winner.
+pub fn prefer(left: &Freshness, right: &Freshness) -> Pick {
     match rank(left, right) {
-        Rank::Left | Rank::Same => Preference::Local,
-        Rank::Right => Preference::Remote,
-        Rank::Ambiguous => Preference::Ambiguous,
+        Rank::Left | Rank::Same => Pick::Local,
+        Rank::Right => Pick::Remote,
+        Rank::Ambiguous => Pick::Ambiguous,
     }
 }
 
+#[derive(PartialEq)]
 enum Rank {
     Left,
     Right,
@@ -181,6 +213,8 @@ pub fn select(
         if let Some(index) = remote_index {
             used_remote[index] = true;
             merged.push(merge_pair(local, &remotes[index])?);
+        } else if local.ambiguous {
+            merged.push(ambiguous_local(local));
         } else {
             merged.push(from_local(local));
         }
@@ -213,13 +247,18 @@ fn matches_scope(
 }
 
 fn merge_pair(local: &LocalView, remote: &RemoteView) -> Result<MergedView> {
-    if remote.ambiguous && !matches!(rank(&local.freshness, &remote.freshness), Rank::Left) {
+    let ordering = rank(&local.freshness, &remote.freshness);
+    // An ambiguous side only loses when the other is strictly newer.
+    if remote.ambiguous && ordering != Rank::Left {
+        return Ok(ambiguous_local(local));
+    }
+    if local.ambiguous && ordering != Rank::Right {
         return Ok(ambiguous_local(local));
     }
     match prefer(&local.freshness, &remote.freshness) {
-        Preference::Local => Ok(from_local(local)),
-        Preference::Remote => Ok(from_remote_with_local(remote, local)),
-        Preference::Ambiguous => Ok(ambiguous_local(local)),
+        Pick::Local => Ok(from_local(local)),
+        Pick::Remote => Ok(from_remote_with_local(remote, local)),
+        Pick::Ambiguous => Ok(ambiguous_local(local)),
     }
 }
 
@@ -317,6 +356,7 @@ mod tests {
             source: format!("src-{id}"),
             fingerprint: format!("fp-{id}"),
             freshness,
+            ambiguous: false,
             info: Info {
                 started_at: at(1),
                 title: Some(format!("title-{id}")),
@@ -351,7 +391,7 @@ mod tests {
             &fresh(Some(10), None, 1, "local"),
             &fresh(Some(4), None, 99, "remote"),
         );
-        assert_eq!(chosen, Preference::Local);
+        assert_eq!(chosen, Pick::Local);
     }
 
     #[test]
@@ -360,13 +400,13 @@ mod tests {
             &fresh(None, Some(2), 5, "local"),
             &fresh(None, Some(8), 1, "remote"),
         );
-        assert_eq!(by_message, Preference::Remote);
+        assert_eq!(by_message, Pick::Remote);
 
         let by_count = prefer(
             &fresh(Some(3), Some(3), 9, "local"),
             &fresh(Some(3), Some(1), 2, "remote"),
         );
-        assert_eq!(by_count, Preference::Local);
+        assert_eq!(by_count, Pick::Local);
     }
 
     #[test]
@@ -375,7 +415,7 @@ mod tests {
             &fresh(Some(3), Some(3), 4, "local"),
             &fresh(Some(3), Some(3), 4, "remote"),
         );
-        assert_eq!(choice, Preference::Ambiguous);
+        assert_eq!(choice, Pick::Ambiguous);
     }
 
     #[test]

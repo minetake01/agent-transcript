@@ -7,18 +7,20 @@ use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::local_state::{LocalStore, SourceRecord};
 use crate::merge::{
-    choose_current, prefer, select, Current, LocalView, MergedView, Pick, Preference, RemoteView,
+    choose_current, prefer, select, Current, LocalView, MergedView, Pick, RemoteView,
 };
 use crate::remote::{document_from_plaintext, load_plaintext};
-use crate::sources::{self, Candidate, LoadFailure};
+use crate::sources::{self, LoadFailure};
 use crate::store::R2;
 
 /// Local session views grouped and deduplicated from the persistent records.
 ///
 /// The records already carry freshness (timestamps, message count, content
 /// hash), so ties are ranked by the same `prefer` the remote merge uses —
-/// no body is read here.
-pub fn local_views(store: &LocalStore) -> Result<Vec<LocalView>> {
+/// no body is read here. A group whose top-ranked copies disagree on the
+/// body is flagged `ambiguous` on the view rather than failing the whole
+/// listing.
+pub fn local_views(store: &LocalStore) -> Vec<LocalView> {
     store
         .grouped()
         .into_values()
@@ -59,14 +61,7 @@ pub async fn transcript(
                     view.harness, view.session_id
                 ))
             })?;
-            let candidate = Candidate {
-                harness: view.harness,
-                source,
-                fingerprint: view.local_fingerprint.clone().unwrap_or_default(),
-            };
-            sources::load(&candidate)
-                .map(|loaded| loaded.transcript)
-                .map_err(|failure| load_error(view, failure))
+            sources::load(view.harness, &source).map_err(|failure| load_error(view, failure))
         }
         Pick::Remote => {
             let object_key = view.object_key.as_deref().ok_or_else(|| {
@@ -81,7 +76,7 @@ pub async fn transcript(
     }
 }
 
-/// Stat fingerprint used as the search-cache key for a merged document.
+/// Stat fingerprint used as the search-index key for a merged document.
 /// Remote documents key on their content hash; local documents on the
 /// source fingerprint recorded by the local state store.
 pub fn fingerprint_of(view: &MergedView) -> String {
@@ -101,24 +96,23 @@ fn view_of(record: &SourceRecord) -> LocalView {
         fingerprint: record.fingerprint.clone(),
         freshness: record.freshness.clone(),
         info: record.info.clone(),
+        ambiguous: false,
     }
 }
 
-fn choose_local(mut group: Vec<LocalView>) -> Result<LocalView> {
+/// Pick the freshest copy of a session; when top-ranked copies disagree on
+/// the body the view is flagged `ambiguous` — the same degraded state a
+/// remote-side tie produces, not a listing error.
+fn choose_local(mut group: Vec<LocalView>) -> LocalView {
     let mut best = group.remove(0);
     for other in group {
         match prefer(&best.freshness, &other.freshness) {
-            Preference::Local => {}
-            Preference::Remote => best = other,
-            Preference::Ambiguous => {
-                return Err(Error::Ambiguous {
-                    harness: best.harness.to_string(),
-                    session_id: best.session_id.clone(),
-                })
-            }
+            Pick::Local => {}
+            Pick::Remote => best = other,
+            Pick::Ambiguous => best.ambiguous = true,
         }
     }
-    Ok(best)
+    best
 }
 
 fn load_error(view: &MergedView, failure: LoadFailure) -> Error {
@@ -163,17 +157,19 @@ fn remote_views(catalog: &Catalog) -> Result<Vec<RemoteView>> {
     Ok(views)
 }
 
+/// Find the session a query selects. Returns the view, the query component
+/// that matched (without any `#range`), and the parsed range request.
 pub fn find_session<'a>(
     merged: &'a [MergedView],
-    query: &str,
-) -> Result<(&'a MergedView, Option<crate::fragment::SpanReq>)> {
+    query: &'a str,
+) -> Result<(&'a MergedView, &'a str, Option<crate::fragment::SpanReq>)> {
     if let Some(found) = unique_match(merged, query)? {
-        return Ok((found, None));
+        return Ok((found, query, None));
     }
     let (src, range) = crate::fragment::parse_ref(query);
     let found = unique_match(merged, src)?
         .ok_or_else(|| Error::msg(format!("no session matches `{src}`")))?;
-    Ok((found, range))
+    Ok((found, src, range))
 }
 
 fn unique_match<'a>(merged: &'a [MergedView], src: &str) -> Result<Option<&'a MergedView>> {

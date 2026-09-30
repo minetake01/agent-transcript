@@ -25,13 +25,15 @@ use crate::store::{Precondition, R2};
 /// Version of the on-disk/R2 snapshot format.
 ///
 /// `txcript::search::Extracted` deliberately has no serialization stability
-/// guarantee, so the txcript version is part of this value.
+/// guarantee, so the txcript version is part of this value. A test asserts
+/// it stays in sync with the Cargo.toml dependency.
 pub const FORMAT: &str = "agent-transcript-search-v1-txcript-0.14.4";
 /// Snapshot schema version.
 pub const SCHEMA: u32 = 1;
 
 const LOCAL_DIRECTORY: &str = "search-index";
-const REMOTE_PREFIX: &str = "v1/search";
+/// Snapshot namespace in the bucket, with trailing slash.
+pub(crate) const SEARCH_PREFIX: &str = "v1/search/";
 
 /// A complete search snapshot for one repository.
 #[derive(Serialize, Deserialize)]
@@ -320,7 +322,7 @@ pub fn local_path(cache_dir: &Path, repo_key: &str) -> PathBuf {
 
 /// Object key of the encrypted R2 snapshot for a repository.
 pub fn remote_key(repo_key: &str) -> String {
-    format!("{REMOTE_PREFIX}/{}", crate::fsutil::repo_digest(repo_key))
+    format!("{SEARCH_PREFIX}{}", crate::fsutil::repo_digest(repo_key))
 }
 
 /// Load and validate a local snapshot. A missing file is not an error.
@@ -382,18 +384,21 @@ pub async fn publish_remote_bytes(r2: &R2, key: &Key, repo_key: &str, plain: &[u
 }
 
 /// Build, cache, and optionally publish the index for one repository.
+///
+/// The caller supplies the already-scanned source state and the current
+/// catalog: `diff` and `load_catalog` run once per operation, not once per
+/// repository.
 pub async fn build_for_repo(
     r2: &R2,
     key: &Key,
     cache_dir: &Path,
     repo_key: &str,
     publish: bool,
-    local: &mut LocalStore,
+    local: &LocalStore,
+    catalog: &crate::catalog::Catalog,
 ) -> Result<Snapshot> {
-    let (catalog, _) = crate::remote::load_catalog(r2, key).await?;
-    local.diff()?;
-    let locals = sessions::local_views(local)?;
-    let merged = sessions::merged(repo_key, None, &locals, &catalog)?;
+    let locals = sessions::local_views(local);
+    let merged = sessions::merged(repo_key, None, &locals, catalog)?;
     let snapshot = Snapshot::from_merged(repo_key, &merged, r2, key, cache_dir).await?;
     if publish {
         publish_remote(r2, key, &snapshot).await?;
@@ -413,8 +418,10 @@ pub async fn build_for_cwd(
     publish: bool,
     local: &mut LocalStore,
 ) -> Result<Snapshot> {
-    let repo_key = requested_repo_key(cwd, process_dir)?;
-    build_for_repo(r2, key, cache_dir, &repo_key, publish, local).await
+    let repo_key = requested_repo_key(cwd, process_dir, local)?;
+    let (catalog, _) = crate::remote::load_catalog(r2, key).await?;
+    local.diff()?;
+    build_for_repo(r2, key, cache_dir, &repo_key, publish, local, &catalog).await
 }
 
 /// Download an already published index without scanning local stores.
@@ -427,14 +434,45 @@ pub async fn download_for_cwd(
     cache_dir: &Path,
     cwd: Option<&str>,
     process_dir: &Path,
+    local: &mut LocalStore,
 ) -> Result<Option<Snapshot>> {
-    let repo_key = requested_repo_key(cwd, process_dir)?;
+    let repo_key = requested_repo_key(cwd, process_dir, local)?;
     load_remote(r2, key, cache_dir, &repo_key).await
 }
 
-/// Resolve a requested cwd to its repository key once: the same normalization
-/// and origin probe every entry point shares.
-fn requested_repo_key(cwd: Option<&str>, process_dir: &Path) -> Result<String> {
+/// The `index` command: build the repository's snapshot on a read-write
+/// install and publish it; on a read-only install fetch the published one,
+/// falling back to a local build when none exists yet.
+pub async fn index(cwd: Option<&str>, process_dir: &Path) -> Result<Snapshot> {
+    let config = crate::config::load_config()?;
+    let key = crate::config::load_key()?;
+    let cache_dir = crate::config::cache_dir()?;
+    let r2 = R2::new(&config);
+    let mut local = LocalStore::load(&cache_dir);
+    let snapshot = if config.can_write() {
+        build_for_cwd(&r2, &key, &cache_dir, cwd, process_dir, true, &mut local).await?
+    } else {
+        match download_for_cwd(&r2, &key, &cache_dir, cwd, process_dir, &mut local).await? {
+            Some(snapshot) => snapshot,
+            None => {
+                build_for_cwd(&r2, &key, &cache_dir, cwd, process_dir, false, &mut local).await?
+            }
+        }
+    };
+    if let Err(error) = local.save_if_dirty() {
+        eprintln!("agent-transcript: saving local state: {error}");
+    }
+    Ok(snapshot)
+}
+
+/// Resolve a requested cwd to its repository key through the shared
+/// resolution cache — the same normalization and origin probe every entry
+/// point shares.
+fn requested_repo_key(
+    cwd: Option<&str>,
+    process_dir: &Path,
+    local: &mut LocalStore,
+) -> Result<String> {
     let directory = repo_id::scope_directory(cwd.map(Path::new), process_dir);
     if !directory.is_dir() {
         return Err(Error::msg(format!(
@@ -442,7 +480,7 @@ fn requested_repo_key(cwd: Option<&str>, process_dir: &Path) -> Result<String> {
             directory.display()
         )));
     }
-    repo_id::origin_of(&directory).map_err(|error| Error::msg(error.to_string()))
+    local.resolve_directory(&directory).into_key(&directory)
 }
 
 fn generation(documents: &[Document]) -> Result<String> {
@@ -534,6 +572,26 @@ mod tests {
         let first = snapshot(repo, vec![(key, first)]);
         let second = snapshot(repo, vec![(key2, second)]);
         assert_ne!(first.generation(), second.generation());
+    }
+
+    /// The format embeds the txcript version because `Extracted` has no
+    /// serialization stability guarantee; it must track the Cargo.toml pin.
+    #[test]
+    fn format_names_the_pinned_txcript_version() {
+        let version = FORMAT
+            .rsplit_once("txcript-")
+            .map(|(_, version)| version)
+            .unwrap();
+        let manifest =
+            fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        let dependency = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with("txcript"))
+            .unwrap();
+        assert!(
+            dependency.contains(&format!("\"{version}\"")),
+            "FORMAT names txcript {version}, Cargo.toml pins {dependency}"
+        );
     }
 
     #[test]

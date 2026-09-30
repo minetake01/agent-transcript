@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use txcript::HarnessId;
 
 use crate::error::{Error, Result};
-use crate::merge::{choose_current, prefer, Current, Freshness, Info, Preference};
+use crate::merge::{choose_current, prefer, Current, Freshness, Info, Pick};
 
 pub const CATALOG_KEY: &str = "v1/catalog";
+/// Object-namespace prefix under which content-addressed bodies live.
+pub const OBJECTS_PREFIX: &str = "v1/objects/";
 pub const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,7 +116,7 @@ pub fn object_key(content_hash: &str) -> Result<String> {
         )));
     }
     Ok(format!(
-        "v1/objects/sha256/{}/{}",
+        "{OBJECTS_PREFIX}sha256/{}/{}",
         &content_hash[..2],
         &content_hash[2..]
     ))
@@ -143,7 +145,7 @@ pub fn prune_to_current(catalog: &mut Catalog) {
         };
         let mut by_hash: HashMap<&str, usize> = HashMap::new();
         for (index, revision) in session.revisions.iter().enumerate() {
-            if matches!(prefer(&ranked[index], &ranked[best]), Preference::Remote) {
+            if matches!(prefer(&ranked[index], &ranked[best]), Pick::Remote) {
                 continue;
             }
             match by_hash.get(revision.freshness.content_hash.as_str()) {

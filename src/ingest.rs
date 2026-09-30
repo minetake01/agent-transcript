@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::local_state::{LocalStore, RecordState};
 use crate::remote::{commit_catalog, load_catalog};
 use crate::search_index;
-use crate::sources::{self, Candidate, LoadFailure};
+use crate::sources::{self, LoadFailure};
 use crate::store::{Precondition, R2};
 use txcript::HarnessId;
 
@@ -73,7 +73,9 @@ pub async fn ingest() -> Result<()> {
         r2.put(&upload.object_key, upload.blob.clone(), Precondition::None)
             .await?;
     }
-    commit_catalog(&r2, &key, &incoming).await?;
+    // The committed catalog feeds the index rebuilds below — no second
+    // catalog fetch per repository.
+    let catalog = commit_catalog(&r2, &key, &incoming).await?;
 
     if sweep_due(local.last_sweep()) {
         match sweep(&r2, &key, &config).await {
@@ -100,7 +102,8 @@ pub async fn ingest() -> Result<()> {
     }
     for repo_key in &index_repos {
         if let Err(error) =
-            search_index::build_for_repo(&r2, &key, &cache_dir, repo_key, true, &mut local).await
+            search_index::build_for_repo(&r2, &key, &cache_dir, repo_key, true, &local, &catalog)
+                .await
         {
             eprintln!("agent-transcript: search index refresh failed: {error}");
         }
@@ -215,11 +218,13 @@ async fn sweep(r2: &R2, key: &Key, config: &config::Config) -> Result<()> {
 /// Whether a bucket object is no longer referenced by the catalog. The
 /// catalog object itself is never an orphan.
 fn is_orphan(key: &str, live: &HashSet<String>, live_indexes: &HashSet<String>) -> bool {
-    match key.strip_prefix("v1/") {
-        Some(rest) if rest.starts_with("objects/") => !live.contains(key),
-        Some(rest) if rest.starts_with("search/") => !live_indexes.contains(key),
-        _ => false,
+    if key.starts_with(crate::catalog::OBJECTS_PREFIX) {
+        return !live.contains(key);
     }
+    if key.starts_with(search_index::SEARCH_PREFIX) {
+        return !live_indexes.contains(key);
+    }
+    false
 }
 
 fn fmt_bytes(bytes: u64) -> String {
@@ -265,14 +270,9 @@ fn scan(mut local: LocalStore, catalog: Catalog, key: Key) -> Result<Scan> {
             unchanged += 1;
             continue;
         }
-        let candidate = Candidate {
-            harness: record.harness,
-            source: record.source.clone(),
-            fingerprint: record.fingerprint.clone(),
-        };
-        match sources::load(&candidate) {
-            Ok(loaded) => {
-                let session_id = loaded.transcript.meta.id.clone();
+        match sources::load(record.harness, &record.source) {
+            Ok(transcript) => {
+                let session_id = transcript.meta.id.clone();
                 if session_id.is_empty() {
                     failures.push(format!(
                         "{} {} — session id is empty",
@@ -280,8 +280,7 @@ fn scan(mut local: LocalStore, catalog: Catalog, key: Key) -> Result<Scan> {
                     ));
                     continue;
                 }
-                let document =
-                    ArchiveDocument::new(record.harness, repo_key.clone(), loaded.transcript);
+                let document = ArchiveDocument::new(record.harness, repo_key.clone(), transcript);
                 let hash = document.content_hash()?;
                 if known.contains(&(record.harness, session_id.clone(), hash.clone())) {
                     // The file moved between the diff and this read, landing
@@ -291,7 +290,8 @@ fn scan(mut local: LocalStore, catalog: Catalog, key: Key) -> Result<Scan> {
                 }
                 let object_key = object_key(&hash)?;
                 let blob = encrypt_document(&key, &object_key, &document)?;
-                let revision = document.revision(&hash, loaded.updated_at, blob.len() as u64)?;
+                let revision =
+                    document.revision(&hash, record.freshness.updated_at, blob.len() as u64)?;
                 let piece = Catalog {
                     schema: SCHEMA,
                     sessions: vec![SessionRecord {

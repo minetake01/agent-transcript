@@ -62,41 +62,6 @@ impl Config {
     }
 }
 
-/// Move the process working directory into this app's cache directory and
-/// return the directory the process was launched in.
-///
-/// A long-lived process holds its working directory open, which on Windows
-/// blocks renaming or deleting that tree — an editor that spawns this binary
-/// from its install directory then fails its own update. Anchoring to a
-/// directory this app owns releases whatever the launcher handed us while the
-/// returned launch directory keeps working-directory semantics (an omitted
-/// `cwd`, a relative `--cwd`) intact.
-pub fn release_launch_directory() -> Result<PathBuf> {
-    let launch = std::env::current_dir()?;
-    for anchor in anchor_candidates() {
-        if anchor.is_dir() && std::env::set_current_dir(&anchor).is_ok() {
-            return Ok(launch);
-        }
-    }
-    Err(Error::msg(
-        "cannot move the process working directory to a stable location",
-    ))
-}
-
-fn anchor_candidates() -> Vec<PathBuf> {
-    let mut anchors = Vec::new();
-    if let Ok(cache) = cache_dir() {
-        if fs::create_dir_all(&cache).is_ok() {
-            anchors.push(cache);
-        }
-    }
-    if let Some(home) = user_home_dir() {
-        anchors.push(home);
-    }
-    anchors.push(std::env::temp_dir());
-    anchors
-}
-
 pub fn user_home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE")
@@ -107,7 +72,8 @@ pub fn user_home_dir() -> Option<PathBuf> {
     home.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
-pub fn home_dir() -> Result<PathBuf> {
+/// The configuration directory — config.toml and the encryption key.
+pub fn config_dir() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("AGENT_TRANSCRIPT_HOME") {
         return Ok(PathBuf::from(home));
     }
@@ -129,15 +95,15 @@ pub fn cache_dir() -> Result<PathBuf> {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         return Ok(PathBuf::from(local).join("agent-transcript").join("cache"));
     }
-    Ok(home_dir()?.join("cache"))
+    Ok(config_dir()?.join("cache"))
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    Ok(home_dir()?.join("config.toml"))
+    Ok(config_dir()?.join("config.toml"))
 }
 
 pub fn key_path() -> Result<PathBuf> {
-    Ok(home_dir()?.join("key"))
+    Ok(config_dir()?.join("key"))
 }
 
 pub fn load_config() -> Result<Config> {
@@ -195,7 +161,7 @@ pub struct InitOptions {
 }
 
 pub fn init(options: InitOptions) -> Result<(PathBuf, bool)> {
-    let dir = home_dir()?;
+    let dir = config_dir()?;
     fs::create_dir_all(&dir)?;
     let config = Config {
         schema: SCHEMA,

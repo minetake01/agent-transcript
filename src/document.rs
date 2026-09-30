@@ -1,12 +1,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use txcript::common::{Message, Meta};
 use txcript::{Common, HarnessId, Transcript};
 
-use crate::catalog::{object_key, Revision, SCHEMA};
+use crate::catalog::{object_key, Revision};
 use crate::crypto::Key;
 use crate::error::Result;
+use crate::merge::{Freshness, Info};
+
+/// Serialized body format version — independent of the catalog's schema:
+/// the two persisted documents evolve separately.
+pub const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArchiveDocument {
@@ -33,8 +37,7 @@ impl ArchiveDocument {
     }
 
     pub fn content_hash(&self) -> Result<String> {
-        let digest = Sha256::digest(self.canonical_bytes()?);
-        Ok(hex::encode(digest))
+        Ok(crate::fsutil::sha256_hex(&self.canonical_bytes()?))
     }
 
     pub fn into_transcript(self) -> Result<Transcript<Common>> {
@@ -54,19 +57,8 @@ impl ArchiveDocument {
     ) -> Result<Revision> {
         Ok(Revision {
             object_key: object_key(hash)?,
-            freshness: crate::merge::Freshness {
-                updated_at,
-                last_message_at: self.messages.last().map(|message| message.timestamp),
-                message_count: self.messages.len() as u64,
-                content_hash: hash.to_string(),
-            },
-            info: crate::merge::Info {
-                started_at: self.meta.timestamp,
-                title: self.meta.title.clone(),
-                cwd: self.meta.cwd.clone(),
-                git_branch: self.meta.git_branch.clone(),
-                model: self.meta.model.clone(),
-            },
+            freshness: Freshness::of_body(&self.messages, updated_at, hash.to_string()),
+            info: Info::of(&self.meta),
             size,
         })
     }
@@ -74,8 +66,4 @@ impl ArchiveDocument {
 
 pub fn encrypt_document(key: &Key, object: &str, document: &ArchiveDocument) -> Result<Vec<u8>> {
     crate::crypto::encrypt(key, object, &document.canonical_bytes()?)
-}
-
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }

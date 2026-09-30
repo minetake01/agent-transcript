@@ -77,15 +77,6 @@ impl R2 {
         self.blocking(move |this| this.head_etag_sync(&key)).await
     }
 
-    pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        Ok(self
-            .list_detailed(prefix)
-            .await?
-            .into_iter()
-            .map(|object| object.key)
-            .collect())
-    }
-
     pub async fn list_detailed(&self, prefix: &str) -> Result<Vec<Listed>> {
         let prefix = prefix.to_string();
         self.blocking(move |this| this.list_detailed_sync(&prefix))
@@ -274,10 +265,7 @@ fn response_error(op: &str, target: &str, response: &mut Response<Body>) -> Erro
 
 /// Parse a `ListObjectsV2` response body into the page's objects, the
 /// truncation flag, and the continuation token.
-fn parse_listing(
-    xml: &str,
-    prefix: &str,
-) -> Result<(Vec<Listed>, bool, Option<String>)> {
+fn parse_listing(xml: &str, prefix: &str) -> Result<(Vec<Listed>, bool, Option<String>)> {
     use xmlparser::{ElementEnd, Token, Tokenizer};
 
     let invalid = |error: xmlparser::Error| {
@@ -444,10 +432,7 @@ mod tests {
 
     #[test]
     fn unescape_decodes_named_and_numeric_entities() {
-        assert_eq!(
-            unescape("a&amp;b&lt;c&gt;d&quot;e&apos;"),
-            "a&b<c>d\"e'"
-        );
+        assert_eq!(unescape("a&amp;b&lt;c&gt;d&quot;e&apos;"), "a&b<c>d\"e'");
         assert_eq!(unescape("x&#65;&#x42;"), "xAB");
         assert_eq!(unescape("plain"), "plain");
         assert_eq!(unescape("a&b"), "a&b");

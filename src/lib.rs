@@ -16,7 +16,7 @@ pub mod remote;
 pub mod repo_id;
 pub mod search_index;
 pub mod sessions;
-mod sigv4;
+pub(crate) mod sigv4;
 pub mod sources;
 pub mod store;
 pub mod update;

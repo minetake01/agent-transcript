@@ -95,9 +95,8 @@ pub fn sign(
         .collect::<Vec<_>>()
         .join(";");
 
-    let canonical_request = format!(
-        "{method}\n{uri}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("{method}\n{uri}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
     let scope = format!("{scope_date}/{REGION}/{SERVICE}/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{date}\n{scope}\n{}",
@@ -125,7 +124,10 @@ mod tests {
 
     #[test]
     fn encode_leaves_unreserved_and_encodes_the_rest() {
-        assert_eq!(encode("v1/objects/sha256/ab/c-d_e.f~g", true), "v1/objects/sha256/ab/c-d_e.f~g");
+        assert_eq!(
+            encode("v1/objects/sha256/ab/c-d_e.f~g", true),
+            "v1/objects/sha256/ab/c-d_e.f~g"
+        );
         assert_eq!(encode("a b+c&d", true), "a%20b%2Bc%26d");
         assert_eq!(encode("a/b", false), "a%2Fb");
     }

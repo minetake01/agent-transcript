@@ -152,25 +152,30 @@ pub fn origin_of(dir: &Path) -> std::result::Result<String, OriginError> {
     })
 }
 
+/// What a directory's repository resolution produced — the shared result
+/// `local_state` caches and every request path interprets.
 #[derive(Debug, Clone)]
-pub enum SessionRepo {
+pub enum RepoResolution {
+    /// `git remote get-url` produced a canonical repo key.
     Key(String),
-    MissingCwd,
-    Unresolved(String),
+    /// The directory is not inside a repository or has no origin (git not
+    /// installed reports the same way: no origin is resolvable).
+    NoOrigin,
+    /// Resolution failed: git config unreadable, remote URL invalid.
+    Failed(String),
 }
 
-pub fn session_repo(cwd: Option<&str>) -> Result<SessionRepo> {
-    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
-        return Ok(SessionRepo::MissingCwd);
-    };
-    let path = normalize_cwd(cwd);
-    if !path.is_dir() {
-        return Ok(SessionRepo::MissingCwd);
-    }
-    match origin_of(&path) {
-        Ok(key) => Ok(SessionRepo::Key(key)),
-        Err(OriginError::GitMissing) => Err(Error::msg("git is not installed")),
-        Err(error) => Ok(SessionRepo::Unresolved(error.to_string())),
+impl RepoResolution {
+    /// The repo key, or the resolution failure as an error.
+    pub fn into_key(self, dir: &Path) -> Result<String> {
+        match self {
+            Self::Key(key) => Ok(key),
+            Self::NoOrigin => Err(Error::msg(format!(
+                "cannot resolve origin of {}",
+                dir.display()
+            ))),
+            Self::Failed(error) => Err(Error::msg(error)),
+        }
     }
 }
 

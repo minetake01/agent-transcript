@@ -70,6 +70,41 @@ impl From<CliMode> for Mode {
     }
 }
 
+/// Move the process working directory into this app's cache directory and
+/// return the directory the process was launched in.
+///
+/// A long-lived process holds its working directory open, which on Windows
+/// blocks renaming or deleting that tree — an editor that spawns this binary
+/// from its install directory then fails its own update. Anchoring to a
+/// directory this app owns releases whatever the launcher handed us while the
+/// returned launch directory keeps working-directory semantics (an omitted
+/// `cwd`, a relative `--cwd`) intact.
+fn release_launch_directory() -> agent_transcript::Result<std::path::PathBuf> {
+    let launch = std::env::current_dir()?;
+    for anchor in anchor_candidates() {
+        if anchor.is_dir() && std::env::set_current_dir(&anchor).is_ok() {
+            return Ok(launch);
+        }
+    }
+    Err(agent_transcript::Error::msg(
+        "cannot move the process working directory to a stable location",
+    ))
+}
+
+fn anchor_candidates() -> Vec<std::path::PathBuf> {
+    let mut anchors = Vec::new();
+    if let Ok(cache) = config::cache_dir() {
+        if std::fs::create_dir_all(&cache).is_ok() {
+            anchors.push(cache);
+        }
+    }
+    if let Some(home) = config::user_home_dir() {
+        anchors.push(home);
+    }
+    anchors.push(std::env::temp_dir());
+    anchors
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = prepare_stdio() {
@@ -212,8 +247,11 @@ mod tests {
 }
 
 async fn run() -> agent_transcript::Result<()> {
-    let launch_dir = config::release_launch_directory()?;
-    match Cli::parse().command {
+    // Parse before releasing the launch directory: `--help` and bad
+    // arguments must not create directories or move the process.
+    let command = Cli::parse().command;
+    let launch_dir = release_launch_directory()?;
+    match command {
         Command::Init {
             account_id,
             bucket,
@@ -254,48 +292,8 @@ async fn run() -> agent_transcript::Result<()> {
             .map_err(agent_transcript::Error::msg),
         Command::Gc => agent_transcript::ingest::gc().await,
         Command::Index { cwd } => {
-            let config = config::load_config()?;
-            let key = config::load_key()?;
-            let cache_dir = config::cache_dir()?;
-            let r2 = agent_transcript::store::R2::new(&config);
-            let can_write = config.can_write();
-            let mut local = agent_transcript::local_state::LocalStore::load(&cache_dir);
-            let snapshot = if can_write {
-                agent_transcript::search_index::build_for_cwd(
-                    &r2,
-                    &key,
-                    &cache_dir,
-                    cwd.as_deref(),
-                    &launch_dir,
-                    true,
-                    &mut local,
-                )
-                .await?
-            } else {
-                match agent_transcript::search_index::download_for_cwd(
-                    &r2,
-                    &key,
-                    &cache_dir,
-                    cwd.as_deref(),
-                    &launch_dir,
-                )
-                .await?
-                {
-                    Some(snapshot) => snapshot,
-                    None => {
-                        agent_transcript::search_index::build_for_cwd(
-                            &r2,
-                            &key,
-                            &cache_dir,
-                            cwd.as_deref(),
-                            &launch_dir,
-                            false,
-                            &mut local,
-                        )
-                        .await?
-                    }
-                }
-            };
+            let snapshot =
+                agent_transcript::search_index::index(cwd.as_deref(), &launch_dir).await?;
             println!(
                 "search index generation {} is ready with {} session(s) for {}",
                 snapshot.generation(),
