@@ -1,6 +1,6 @@
 [package]
 name = "agent-transcript"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Read-only archive of coding-agent transcripts on Cloudflare R2."
 license = "Apache-2.0"

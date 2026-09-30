@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agent-transcript"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chacha20poly1305",
  "chrono",
